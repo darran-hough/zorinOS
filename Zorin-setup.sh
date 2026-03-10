@@ -5,7 +5,11 @@
 #  Covers : Gaming, Video Production, Media Playback, Hardware Acceleration
 #  Target : Zorin OS 18 (Ubuntu 24.04 LTS base, Kernel 6.14+)
 #
-#  RESILIENCE FEATURES:
+#  DISPLAY:
+#    - Wayland-first: no Xorg config written, GDM Wayland stays enabled
+#    - AMD/Intel GPU drivers only -- install GPU drivers manually if needed
+#
+#  RESILIENCE:
 #    - Never exits on error; all errors collected and reported at the end
 #    - Every install checks if already present and skips if so (idempotent)
 #    - Safe to run multiple times without breaking anything
@@ -322,6 +326,14 @@ LOGFILE="/var/log/zorin-gaming-media-setup.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 log "Logging to: $LOGFILE"
 
+# ── Cleanup leftover repo files from previous script runs ────────────────────
+if [[ -f /etc/apt/sources.list.d/amdvlk.list ]]; then
+  rm -f /etc/apt/sources.list.d/amdvlk.list
+  rm -f /etc/apt/keyrings/amdvlk.gpg 2>/dev/null || true
+  log "Removed leftover amdvlk repo (was added by a previous script run with wrong distro codename)"
+  apt-get update -y 2>&1 || true
+fi
+
 # =============================================================================
 #  STEP 1 -- HARDWARE DETECTION
 # =============================================================================
@@ -353,51 +365,42 @@ if [[ "$CPU_TYPE" == "amd" ]]; then
   info "Ryzen generation: $RYZEN_GEN"
 fi
 
-# ── GPU ───────────────────────────────────────────────────────────────────────
+# ── GPU -- detect active driver ───────────────────────────────────────────────
 GPU_INFO=$(lspci 2>/dev/null | grep -iE "VGA|3D|Display" || true)
-[[ -z "$GPU_INFO" ]] && record_warning "No GPU detected via lspci -- GPU driver install will be skipped"
 info "GPU(s): ${GPU_INFO:-none detected}"
 
-GPU_TYPE="generic"
-NVIDIA_CARD=""; NVIDIA_GEN=""; NVIDIA_DRIVER=""
-HW_ACCEL_NVENC=false; HW_ACCEL_VAAPI=false; HW_ACCEL_QSV=false
+# Use /sys/bus/pci/devices as the most reliable source for active driver
+# lspci -k can miss the driver line if -A count is too small
+ACTIVE_GPU_DRIVER=""
 
-if echo "$GPU_INFO" | grep -qi "NVIDIA"; then
-  GPU_TYPE="nvidia"
-  NVIDIA_CARD=$(echo "$GPU_INFO" | grep -i "NVIDIA" | sed 's/.*\[//;s/\]//' | head -1)
-  log "NVIDIA GPU: $NVIDIA_CARD"
-
-  if   echo "$NVIDIA_CARD" | grep -qiE "RTX 50|50[0-9]{2}"; then
-    NVIDIA_GEN="50series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 40|40[0-9]{2}"; then
-    NVIDIA_GEN="40series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 30|30[0-9]{2}"; then
-    NVIDIA_GEN="30series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 20|20[0-9]{2}|GTX 16"; then
-    NVIDIA_GEN="turing";         NVIDIA_DRIVER="nvidia-driver-550"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 10|10[0-9]{2}"; then
-    NVIDIA_GEN="pascal";         NVIDIA_DRIVER="nvidia-driver-470"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 9[0-9]{2}|GTX 7[0-9]{2}|GTX 6[0-9]{2}"; then
-    NVIDIA_GEN="maxwell_kepler"; NVIDIA_DRIVER="nvidia-driver-390"; HW_ACCEL_NVENC=true
-  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 58[0-9]|GTX 59[0-9]|GTX 4[0-9]{2}|GTX 5[0-7][0-9]"; then
-    NVIDIA_GEN="fermi";          NVIDIA_DRIVER="nvidia-driver-340"; HW_ACCEL_NVENC=false
-    record_warning "Fermi GPU (GTX 5xx/4xx): nvidia-340 is EOL and may not be in Ubuntu 24.04 repos"
-  else
-    NVIDIA_GEN="unknown";        NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
-    record_warning "Unknown NVIDIA GPU model -- defaulting to driver 570"
+# Method 1: check /sys directly for the GPU PCI device's driver
+for pci_dev in /sys/bus/pci/devices/*/; do
+  class=$(cat "$pci_dev/class" 2>/dev/null || echo "")
+  # PCI class 0x0300 = VGA, 0x0302 = 3D controller, 0x0380 = Display
+  if [[ "$class" =~ ^0x03(00|02|80) ]]; then
+    if [[ -L "$pci_dev/driver" ]]; then
+      ACTIVE_GPU_DRIVER=$(basename "$(readlink "$pci_dev/driver")" 2>/dev/null || true)
+      break
+    fi
   fi
-  info "NVIDIA: gen=$NVIDIA_GEN | driver=$NVIDIA_DRIVER | NVENC=$HW_ACCEL_NVENC"
+done
 
-elif echo "$GPU_INFO" | grep -qi "AMD\|ATI\|Radeon"; then
-  GPU_TYPE="amd"
-  HW_ACCEL_VAAPI=true
-  log "AMD GPU detected (VAAPI: supported)"
-
-elif echo "$GPU_INFO" | grep -qi "Intel"; then
-  GPU_TYPE="intel"
-  HW_ACCEL_VAAPI=true; HW_ACCEL_QSV=true
-  log "Intel iGPU detected (VAAPI + QuickSync: supported)"
+# Method 2: fallback to lspci -k with generous context
+if [[ -z "$ACTIVE_GPU_DRIVER" ]]; then
+  ACTIVE_GPU_DRIVER=$(lspci -k 2>/dev/null | grep -A5 -iE "VGA compatible|3D controller|Display controller" | grep "Kernel driver in use" | awk '{print $NF}' | head -1 || true)
 fi
+
+info "Active GPU driver: ${ACTIVE_GPU_DRIVER:-none detected}"
+
+GPU_DRIVER_TYPE="unknown"
+if   [[ "$ACTIVE_GPU_DRIVER" == "nvidia" ]];  then GPU_DRIVER_TYPE="nvidia"
+elif [[ "$ACTIVE_GPU_DRIVER" == "amdgpu" ]];  then GPU_DRIVER_TYPE="amdgpu"
+elif [[ "$ACTIVE_GPU_DRIVER" == "radeon" ]];  then GPU_DRIVER_TYPE="radeon"
+elif [[ "$ACTIVE_GPU_DRIVER" == "i915" ]];    then GPU_DRIVER_TYPE="intel"
+elif [[ "$ACTIVE_GPU_DRIVER" == "xe" ]];      then GPU_DRIVER_TYPE="intel"
+elif [[ "$ACTIVE_GPU_DRIVER" == "nouveau" ]]; then GPU_DRIVER_TYPE="nouveau"
+fi
+log "GPU driver type: $GPU_DRIVER_TYPE"
 
 # ── Motherboard ───────────────────────────────────────────────────────────────
 MB_MANUFACTURER=$(cat /sys/class/dmi/id/board_vendor  2>/dev/null || echo "Unknown")
@@ -472,11 +475,11 @@ fi
 echo ""
 echo -e "${BOLD}--- Detection Summary -----------------------------------------${NC}"
 echo -e "  CPU     : $CPU_MODEL ($CPU_TYPE, $CPU_CORES threads)"
-echo -e "  GPU     : ${GPU_INFO:-(none)} ($GPU_TYPE)"
+echo -e "  GPU     : ${GPU_INFO:-(none detected)}"
+echo -e "  DRIVER  : ${ACTIVE_GPU_DRIVER:-none} ($GPU_DRIVER_TYPE)"
 echo -e "  MOBO    : $MB_MANUFACTURER $MB_MODEL ($MB_TYPE)"
 echo -e "  RAM     : ${RAM_GB}GB"
 echo -e "  DISK    : $DISK_TYPE"
-echo -e "  NVENC   : $HW_ACCEL_NVENC  | VAAPI: $HW_ACCEL_VAAPI  | QSV: $HW_ACCEL_QSV"
 echo -e "  SCARLETT: $SCARLETT_MODEL (gen: $SCARLETT_GEN)"
 echo -e "${BOLD}--------------------------------------------------------------${NC}"
 echo ""
@@ -520,118 +523,47 @@ safe_run "Flathub remote" "Run: flatpak remote-add --if-not-exists flathub https
   flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
 # =============================================================================
-#  STEP 3 -- GPU DRIVERS
+#  STEP 3 -- GPU SUPPORT LIBRARIES
+#  Detects the active GPU driver and installs the matching userspace
+#  libraries (Vulkan, VAAPI, VDPAU). Does NOT install or modify any driver.
 # =============================================================================
-section "GPU Drivers"
+section "GPU Support Libraries"
 
-if [[ "$GPU_TYPE" == "nvidia" ]]; then
+info "Active GPU driver detected: ${ACTIVE_GPU_DRIVER:-none} ($GPU_DRIVER_TYPE)"
 
-  # Blacklist Nouveau -- only write if not already blacklisted
-  if ! grep -q "blacklist nouveau" /etc/modprobe.d/blacklist-nouveau.conf 2>/dev/null; then
-    safe_write "Nouveau blacklist" /etc/modprobe.d/blacklist-nouveau.conf <<'MODEOF'
-blacklist nouveau
-options nouveau modeset=0
-MODEOF
-    safe_run "initramfs update (Nouveau blacklist)" \
-      "Run manually: sudo update-initramfs -u" \
-      update-initramfs -u
-  else
-    skipped "Nouveau already blacklisted"
-    SKIPPED+=("Nouveau blacklist")
-  fi
+# Vulkan loader -- needed by all GPU types
+safe_apt "Vulkan loader + tools" libvulkan1 vulkan-tools
 
-  if [[ "$NVIDIA_GEN" == "fermi" ]]; then
-    if pkg_installed "nvidia-driver-340"; then
-      skipped "NVIDIA driver (340 -- Fermi)"
-      SKIPPED+=("NVIDIA driver 340")
-    elif apt-cache show nvidia-driver-340 &>/dev/null; then
-      safe_apt_full "NVIDIA driver 340 (Fermi legacy)" nvidia-driver-340
-    else
-      record_error "nvidia-driver-340 not in repos (Fermi/GTX 580/590 is EOL on Ubuntu 24.04)" \
-        "Download manually from: https://www.nvidia.com/en-us/drivers/ or consider ubuntu-drivers autoinstall"
-      info "Attempting ubuntu-drivers autoinstall as fallback..."
-      ubuntu-drivers autoinstall 2>&1 || record_error "ubuntu-drivers autoinstall also failed" \
-        "Manual driver install required for your GPU"
-    fi
-  else
-    # Check if ANY nvidia driver is already installed
-    if dpkg-query -l 'nvidia-driver-*' 2>/dev/null | grep -q "^ii"; then
-      INSTALLED_DRV=$(dpkg-query -l 'nvidia-driver-*' 2>/dev/null | grep "^ii" | awk '{print $2}' | head -1)
-      if pkg_installed "$NVIDIA_DRIVER"; then
-        skipped "NVIDIA driver ($NVIDIA_DRIVER) already installed"
-        SKIPPED+=("NVIDIA driver $NVIDIA_DRIVER")
-      else
-        record_warning "Different NVIDIA driver installed ($INSTALLED_DRV). Target is $NVIDIA_DRIVER."
-        read -rp "Replace $INSTALLED_DRV with $NVIDIA_DRIVER? [y/N]: " REPLACE_DRV
-        REPLACE_DRV="${REPLACE_DRV:-N}"
-        if [[ "$REPLACE_DRV" =~ ^[Yy]$ ]]; then
-          safe_apt_full "NVIDIA driver $NVIDIA_DRIVER" "$NVIDIA_DRIVER" nvidia-settings nvidia-prime
-        else
-          info "Keeping existing driver $INSTALLED_DRV"
-          SKIPPED+=("NVIDIA driver (kept existing $INSTALLED_DRV)")
-        fi
-      fi
-    else
-      safe_apt_full "NVIDIA driver $NVIDIA_DRIVER" "$NVIDIA_DRIVER" nvidia-settings nvidia-prime
-    fi
-  fi
+if [[ "$GPU_DRIVER_TYPE" == "nvidia" ]]; then
+  # NVIDIA driver already installed and active -- add NVENC/NVDEC support libs
+  NVDRIVER=$(dpkg-query -l 'nvidia-driver-*' 2>/dev/null | grep "^ii" | awk '{print $2}' | head -1 || true)
+  log "NVIDIA driver active: ${NVDRIVER:-confirmed via /sys}"
+  safe_apt "NVIDIA CUDA toolkit (NVENC/NVDEC)" nvidia-cuda-toolkit
+  info "NVENC encoder available in OBS: Settings -> Output -> NVENC H.264 / NVENC HEVC"
+  info "FFmpeg NVENC usage: -c:v h264_nvenc or -c:v hevc_nvenc"
 
-  # NVIDIA Xorg config -- only write if not present
-  if [[ ! -f /etc/X11/xorg.conf.d/20-nvidia-gaming.conf ]]; then
-    mkdir -p /etc/X11/xorg.conf.d
-    safe_write "NVIDIA Xorg gaming config" /etc/X11/xorg.conf.d/20-nvidia-gaming.conf <<'XORGEOF'
-Section "Device"
-    Identifier     "NVIDIA GPU"
-    Driver         "nvidia"
-    Option         "TripleBuffer"                 "true"
-    Option         "ForceCompositionPipeline"     "true"
-    Option         "ForceFullCompositionPipeline" "true"
-    Option         "AllowIndirectGLXProtocol"     "off"
-EndSection
-XORGEOF
-  else
-    skipped "NVIDIA Xorg config (already present)"
-    SKIPPED+=("NVIDIA Xorg config")
-  fi
-
-  safe_run "NVIDIA persistence mode enable" \
-    "Run: sudo systemctl enable nvidia-persistenced" \
-    systemctl enable nvidia-persistenced
-
-  # NVENC libs
-  if [[ "$HW_ACCEL_NVENC" == "true" ]]; then
-    safe_apt "NVIDIA CUDA toolkit (NVENC)" nvidia-cuda-toolkit
-  fi
-
-  # ReBAR check
-  if lspci -v 2>/dev/null | grep -qi "Resizable BAR"; then
-    log "Resizable BAR (ReBAR) is active"
-  else
-    record_warning "ReBAR not active. Enable in MSI BIOS: Above 4G Decoding + Resizable BAR for up to 15% FPS gain"
-  fi
-
-elif [[ "$GPU_TYPE" == "amd" ]]; then
-
-  safe_ppa "ppa:kisak/kisak-mesa"
-  safe_apt_full "AMD Mesa + AMDVLK + VAAPI" \
+elif [[ "$GPU_DRIVER_TYPE" =~ ^(amdgpu|radeon)$ ]]; then
+  safe_apt "AMD Vulkan + VAAPI libs" \
     mesa-vulkan-drivers mesa-vdpau-drivers \
-    libvulkan1 vulkan-tools amdvlk \
-    libva-drm2 libva-x11-2 vainfo mesa-va-drivers
+    libva-dev libva-drm2 libva-x11-2
+  info "FFmpeg VAAPI usage: -hwaccel vaapi -c:v h264_vaapi"
 
-  safe_write "AMD GPU performance udev rule" /etc/udev/rules.d/30-amdgpu-pm.rules <<'UDEVEOF'
-KERNEL=="card0", SUBSYSTEM=="drm", DRIVERS=="amdgpu", ATTR{device/power_dma_latency}="0"
-UDEVEOF
-
-elif [[ "$GPU_TYPE" == "intel" ]]; then
-
-  safe_apt "Intel VAAPI + QuickSync" \
+elif [[ "$GPU_DRIVER_TYPE" == "intel" ]]; then
+  safe_apt "Intel Vulkan + VAAPI + QuickSync libs" \
+    mesa-vulkan-drivers \
     intel-media-va-driver i965-va-driver \
-    vainfo libva-drm2 libva-x11-2
+    libva-dev libva-drm2 libva-x11-2
+  info "FFmpeg VAAPI/QSV usage: -hwaccel vaapi -c:v h264_vaapi"
 
+elif [[ "$GPU_DRIVER_TYPE" == "nouveau" ]]; then
+  safe_apt "Nouveau Vulkan + VAAPI libs" \
+    mesa-vulkan-drivers mesa-vdpau-drivers \
+    libva-dev libva-drm2 libva-x11-2
+  record_warning "Nouveau driver active -- limited performance. Install the proprietary NVIDIA driver for full gaming and encoding support."
+
+else
+  record_warning "No recognised GPU driver detected (found: ${ACTIVE_GPU_DRIVER:-none}) -- skipping GPU-specific libs. Install your GPU driver first and re-run this script."
 fi
-
-# Vulkan support for all GPU types
-safe_apt "Vulkan tools" vulkan-tools libvulkan1
 
 # =============================================================================
 #  STEP 4 -- CPU OPTIMISATIONS
@@ -760,31 +692,20 @@ safe_apt "GStreamer core stack" \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
   gstreamer1.0-libav \
-  gstreamer1.0-vaapi \
   gstreamer1.0-pipewire
 
 safe_apt "Image codec libraries" \
   libheif-dev libraw-dev \
   libjpeg-dev libpng-dev libtiff-dev libwebp-dev
 
-# GPU-accelerated FFmpeg encoding
-if [[ "$GPU_TYPE" == "nvidia" ]] && [[ "$HW_ACCEL_NVENC" == "true" ]]; then
-  if ffmpeg -encoders 2>/dev/null | grep -q nvenc; then
-    log "FFmpeg NVENC encoder: READY"
-  else
-    warn "FFmpeg NVENC not active yet -- will be available after reboot with driver"
-  fi
-  info "FFmpeg NVENC usage: -c:v h264_nvenc or -c:v hevc_nvenc"
-fi
+safe_apt "GStreamer VAAPI plugin" gstreamer1.0-vaapi
 
-if [[ "$HW_ACCEL_VAAPI" == "true" ]]; then
-  safe_apt "VAAPI development library" libva-dev
-  if ffmpeg -hwaccels 2>/dev/null | grep -q vaapi; then
-    log "FFmpeg VAAPI acceleration: READY"
-  else
-    warn "FFmpeg VAAPI not active yet -- will be available after reboot"
-  fi
+# VAAPI FFmpeg check -- informational only
+if ffmpeg -hwaccels 2>/dev/null | grep -q vaapi; then
+  log "FFmpeg VAAPI acceleration: READY"
   info "FFmpeg VAAPI usage: -hwaccel vaapi -c:v h264_vaapi"
+else
+  info "FFmpeg VAAPI will be active once GPU drivers are installed"
 fi
 
 # =============================================================================
@@ -1024,9 +945,8 @@ if [[ -f "$MPV_CONF" ]]; then
   SKIPPED+=("MPV config")
 else
   mkdir -p "$USER_HOME/.config/mpv"
-  {
-    cat <<'MPVEOF'
-# MPV -- hardware accelerated, high quality
+  cat > "$MPV_CONF" <<'MPVEOF'
+# MPV -- hardware accelerated via VAAPI, high quality scaling
 profile=gpu-hq
 scale=lanczos
 cscale=spline36
@@ -1034,13 +954,11 @@ dscale=mitchell
 video-sync=display-resample
 interpolation=yes
 tscale=oversample
+hwdec=vaapi
+gpu-api=vulkan
 MPVEOF
-    if   [[ "$GPU_TYPE" == "nvidia" ]]; then printf "hwdec=nvdec\ngpu-api=vulkan\n"
-    elif [[ "$GPU_TYPE" =~ ^(amd|intel)$ ]]; then printf "hwdec=vaapi\ngpu-api=vulkan\n"
-    fi
-  } > "$MPV_CONF"
   chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$USER_HOME/.config/mpv" 2>/dev/null || true
-  log "MPV config written (hwdec: $([ "$GPU_TYPE" == "nvidia" ] && echo nvdec || echo vaapi))"
+  log "MPV config written with VAAPI hardware acceleration"
   INSTALLED+=("MPV config")
 fi
 
@@ -1051,18 +969,13 @@ safe_flatpak "HandBrake"     "fr.handbrake.ghb"
 echo ""
 media "DaVinci Resolve: manual install required"
 info "  -> https://www.blackmagicdesign.com/products/davinciresolve"
-info "  -> Zorin OS 18 + NVIDIA: fully supported (Resolve 19+)"
 info "  -> AMD: free version supported (ROCM support varies by card)"
 echo ""
 
 # Streaming
 safe_ppa "ppa:obsproject/obs-studio"
 safe_apt_full "OBS Studio" obs-studio
-if [[ "$HW_ACCEL_NVENC" == "true" ]]; then
-  info "OBS: Settings -> Output -> Encoder -> NVENC H.264 or NVENC HEVC"
-elif [[ "$HW_ACCEL_VAAPI" == "true" ]]; then
-  info "OBS: Settings -> Output -> Encoder -> VA-API H.264"
-fi
+info "OBS: Settings -> Output -> Encoder -> VA-API H.264 (once GPU drivers installed)"
 
 # Photo editing
 safe_apt "GIMP + plugins" gimp gimp-plugin-registry gimp-gmic
@@ -1243,12 +1156,28 @@ MHEOF
 fi
 
 # =============================================================================
-#  STEP 12 -- DISPLAY SERVER CHECK
+#  STEP 12 -- DISPLAY SERVER (WAYLAND)
 # =============================================================================
-section "Display Server"
+section "Display Server -- Wayland"
 
-if [[ "$GPU_TYPE" == "nvidia" ]]; then
-  record_warning "NVIDIA GPU: X11 is more stable than Wayland for gaming, OBS, and DaVinci Resolve. Switch at login (gear icon -> Zorin Desktop on Xorg)."
+log "Zorin OS 18 uses Wayland by default -- no display server configuration needed"
+info "GPU driver (AMD/Intel) fully supports Wayland on kernel 6.14"
+
+# Ensure GDM is not locked to X11 from any previous configuration
+GDM_CONF="/etc/gdm3/custom.conf"
+if [[ -f "$GDM_CONF" ]] && grep -q "WaylandEnable=false" "$GDM_CONF"; then
+  sed -i 's/WaylandEnable=false/WaylandEnable=true/' "$GDM_CONF" && \
+    log "GDM Wayland re-enabled (was previously disabled)" || \
+    record_warning "Could not re-enable Wayland in GDM -- check $GDM_CONF"
+else
+  log "GDM Wayland: enabled (default)"
+fi
+
+# Remove any X11-forcing environment overrides
+if [[ -f /etc/environment ]] && grep -q "GDK_BACKEND=x11" /etc/environment; then
+  sed -i '/GDK_BACKEND=x11/d' /etc/environment && \
+    log "Removed GDK_BACKEND=x11 from /etc/environment" || \
+    record_warning "Could not remove GDK_BACKEND=x11 from /etc/environment"
 fi
 
 # =============================================================================
@@ -1275,7 +1204,8 @@ echo -e "${NC}"
 
 echo -e "${BOLD}Detected Hardware:${NC}"
 echo "  CPU     : $CPU_MODEL ($CPU_TYPE, $CPU_CORES threads)"
-echo "  GPU     : $GPU_TYPE $([ "$GPU_TYPE" == "nvidia" ] && echo "-> $NVIDIA_DRIVER" || echo "")"
+echo "  GPU     : $GPU_INFO"
+echo "  DRIVER  : ${ACTIVE_GPU_DRIVER:-none} ($GPU_DRIVER_TYPE)"
 echo "  MOBO    : $MB_MANUFACTURER $MB_MODEL ($MB_TYPE)"
 echo "  RAM     : ${RAM_GB}GB | DISK: $DISK_TYPE"
 echo "  Scarlett: $SCARLETT_MODEL (gen: $SCARLETT_GEN)"
@@ -1304,24 +1234,15 @@ echo ""
 echo "  2. Per-game Steam launch options:"
 echo "     DXVK_ASYNC=1 gamemoderun mangohud %command%"
 echo ""
-echo "  3. OBS Studio -> Settings -> Output -> Encoder:"
-if [[ "$HW_ACCEL_NVENC" == "true" ]];   then echo "     -> Select 'NVENC H.264' or 'NVENC HEVC'"
-elif [[ "$HW_ACCEL_VAAPI" == "true" ]]; then echo "     -> Select 'VA-API H.264'"; fi
+echo "  3. OBS Studio -> Settings -> Output -> Encoder -> VA-API H.264"
 echo ""
-echo "  4. MSI BIOS (if not done):"
 echo "     -> Enable A-XMP/EXPO (RAM rated speed)"
 echo "     -> Enable Resizable BAR + Above 4G Decoding"
 echo "     -> Set PCIe to Gen 4/5"
 echo ""
-if [[ "$GPU_TYPE" == "nvidia" ]]; then
-  echo "  5. nvidia-settings after reboot:"
-  echo "     -> PowerMizer -> Prefer Maximum Performance"
-  echo "     -> Enable ForceCompositionPipeline (X11 only)"
-  echo ""
-fi
-echo "  6. DaVinci Resolve: https://www.blackmagicdesign.com/products/davinciresolve"
+echo "  5. DaVinci Resolve: https://www.blackmagicdesign.com/products/davinciresolve"
 echo ""
-echo "  7. Focusrite Scarlett ($SCARLETT_MODEL):"
+echo "  6. Focusrite Scarlett ($SCARLETT_MODEL):"
 if [[ "$SCARLETT_GEN" =~ ^(3rd|4th|4th_fcp)$ ]]; then
   echo "     -> Disable MSD mode: hold 48V on power-on OR run alsa-scarlett-gui -> Startup -> Disable MSD"
 fi
