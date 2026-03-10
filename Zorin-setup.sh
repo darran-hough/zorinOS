@@ -1,851 +1,1368 @@
 #!/bin/bash
 # =============================================================================
-# Zorin OS Gaming + Audio Production Setup Script
-# =============================================================================
-# Installs and configures:
-#   - Timeshift system snapshot (safety net before changes)
-#   - Steam + Proton + GameMode (gaming optimisation)
-#   - Heroic Games Launcher (Epic/GOG)
-#   - ProtonPlus (Proton-GE / Wine-GE manager)
-#   - GPU auto-detection (Nvidia / AMD / Intel drivers)
-#   - Peripheral support: Piper/libratbag (Logitech/Razer mice)
-#   - Razer device support (OpenRazer + Polychromatic)
-#   - Controller support (Xbox xpadneo, PS4/PS5, generic)
-#   - Focusrite Scarlett auto-detection + alsa-scarlett-gui
-#   - PipeWire low latency audio configuration
-#   - Real-time audio privileges (limits.conf + PAM)
-#   - Cadence (KXStudio audio toolbox)
-#   - Swappiness tuning + CPU governor (performance)
-#   - Low latency kernel
-#   - Vesktop (optimised Discord)
-#   - Flatseal (Flatpak permission manager)
-#   - MangoHud performance overlay
+#  Zorin OS 18 -- Gaming & Media Beast Setup Script
+#  Detects: CPU, GPU, Motherboard, Focusrite Scarlett
+#  Covers : Gaming, Video Production, Media Playback, Hardware Acceleration
+#  Target : Zorin OS 18 (Ubuntu 24.04 LTS base, Kernel 6.14+)
 #
-# Safe to run multiple times — all installs are idempotent.
+#  RESILIENCE FEATURES:
+#    - Never exits on error; all errors collected and reported at the end
+#    - Every install checks if already present and skips if so (idempotent)
+#    - Safe to run multiple times without breaking anything
+#    - Full error summary with actionable fix hints printed at the end
+#    - All operations wrapped in try/catch-style handlers
 # =============================================================================
 
-set -euo pipefail
+# DO NOT use set -e here -- we handle errors manually and never abort mid-run
+set -uo pipefail
 
-# --- Colours ------------------------------------------------------------------
+# =============================================================================
+#  COLOURS & LOGGING
+# =============================================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
-NC='\033[0m' # No Colour
+NC='\033[0m'
 
-# --- Helpers ------------------------------------------------------------------
-log()     { echo -e "${GREEN}[✓]${NC} $1"; }
-info()    { echo -e "${BLUE}[i]${NC} $1"; }
-warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
-error()   { echo -e "${RED}[✗]${NC} $1"; }
-section() { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}\n"; }
+log()     { echo -e "${GREEN}[OK]${NC} $1"; }
+info()    { echo -e "${CYAN}[>>]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[!!]${NC} $1"; }
+skipped() { echo -e "${BLUE}[--]${NC} $1 -- already installed, skipping"; }
+err_msg() { echo -e "${RED}[XX]${NC} $1"; }
+media()   { echo -e "${MAGENTA}[AV]${NC} $1"; }
+section() {
+  echo ""
+  echo -e "${BOLD}${BLUE}=================================================${NC}"
+  echo -e "${BOLD}${BLUE}  $1${NC}"
+  echo -e "${BOLD}${BLUE}=================================================${NC}"
+  echo ""
+}
 
-# --- Root check ---------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    error "Please run this script with sudo: sudo bash $0"
-    exit 1
+# =============================================================================
+#  ERROR & SKIP TRACKING
+# =============================================================================
+ERRORS=()       # Collected errors -- printed in full at the end
+SKIPPED=()      # Items that were already installed
+INSTALLED=()    # Items successfully installed this run
+WARNINGS=()     # Non-fatal warnings worth noting
+
+# Record an error without stopping the script
+record_error() {
+  local msg="$1"
+  local hint="${2:-}"
+  err_msg "$msg"
+  if [[ -n "$hint" ]]; then
+    ERRORS+=("ERROR: $msg || FIX: $hint")
+  else
+    ERRORS+=("ERROR: $msg")
+  fi
+}
+
+# Record a warning
+record_warning() {
+  warn "$1"
+  WARNINGS+=("$1")
+}
+
+# =============================================================================
+#  SAFE OPERATION HELPERS
+# =============================================================================
+
+# Safe apt install -- skips packages that are already installed
+# Usage: safe_apt "description" pkg1 pkg2 ...
+safe_apt() {
+  local desc="$1"; shift
+  local pkgs=("$@")
+  local to_install=()
+  local already=()
+
+  for pkg in "${pkgs[@]}"; do
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      already+=("$pkg")
+    else
+      to_install+=("$pkg")
+    fi
+  done
+
+  if [[ ${#already[@]} -gt 0 ]]; then
+    skipped "$desc (packages present: ${already[*]})"
+    SKIPPED+=("$desc")
+  fi
+
+  if [[ ${#to_install[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  info "Installing: ${to_install[*]}"
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      "${to_install[@]}" 2>&1; then
+    log "$desc installed"
+    INSTALLED+=("$desc")
+  else
+    record_error "APT install failed: $desc (${to_install[*]})" \
+      "Run manually: sudo apt install ${to_install[*]}"
+  fi
+}
+
+# Safe apt install (full recommends -- for GPU drivers and heavier packages)
+safe_apt_full() {
+  local desc="$1"; shift
+  local pkgs=("$@")
+  local to_install=()
+
+  for pkg in "${pkgs[@]}"; do
+    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      true  # part already installed, apt will skip it gracefully
+    else
+      to_install+=("$pkg")
+    fi
+  done
+
+  if [[ ${#to_install[@]} -eq 0 ]]; then
+    skipped "$desc"
+    SKIPPED+=("$desc")
+    return 0
+  fi
+
+  info "Installing: ${to_install[*]}"
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "${to_install[@]}" 2>&1; then
+    log "$desc installed"
+    INSTALLED+=("$desc")
+  else
+    record_error "APT install failed: $desc (${to_install[*]})" \
+      "Run manually: sudo apt install ${to_install[*]}"
+  fi
+}
+
+# Safe flatpak install -- skips if app already installed
+# Usage: safe_flatpak "description" "app.id"
+safe_flatpak() {
+  local desc="$1"
+  local app_id="$2"
+
+  if flatpak list --app 2>/dev/null | grep -q "$app_id"; then
+    skipped "$desc (Flatpak: $app_id)"
+    SKIPPED+=("$desc")
+    return 0
+  fi
+
+  if flatpak install -y --noninteractive flathub "$app_id" 2>&1; then
+    log "$desc installed (Flatpak)"
+    INSTALLED+=("$desc")
+  else
+    record_error "Flatpak install failed: $desc ($app_id)" \
+      "Run manually: flatpak install flathub $app_id"
+  fi
+}
+
+# Safe PPA add -- skips if already present
+# Usage: safe_ppa "ppa:name/ppa"
+safe_ppa() {
+  local ppa="$1"
+  local ppa_file
+  ppa_file=$(echo "$ppa" | sed 's|ppa:||;s|/|-|' )
+
+  if find /etc/apt/sources.list.d/ -name "*${ppa_file}*" 2>/dev/null | grep -q .; then
+    skipped "PPA $ppa"
+    return 0
+  fi
+
+  if add-apt-repository -y "$ppa" 2>&1; then
+    log "PPA added: $ppa"
+    apt-get update -y 2>&1 || record_warning "apt update after adding $ppa had warnings"
+  else
+    record_error "Failed to add PPA: $ppa" "Run manually: sudo add-apt-repository -y $ppa"
+  fi
+}
+
+# Safe git clone -- skips if directory already exists and is a git repo
+# Usage: safe_clone "description" "url" "/dest/path"
+safe_clone() {
+  local desc="$1"
+  local url="$2"
+  local dest="$3"
+
+  if [[ -d "$dest/.git" ]]; then
+    info "$desc repo exists -- pulling latest..."
+    git -C "$dest" pull --ff-only 2>&1 || \
+      record_warning "git pull failed for $desc -- using existing version"
+    return 0
+  fi
+
+  rm -rf "$dest"
+  if git clone "$url" "$dest" 2>&1; then
+    log "$desc cloned"
+  else
+    record_error "git clone failed: $desc ($url)" \
+      "Check network connectivity and retry"
+    return 1
+  fi
+}
+
+# Safe run -- runs a command, records error if it fails, never stops script
+# Usage: safe_run "description" "hint on failure" command args...
+safe_run() {
+  local desc="$1"
+  local hint="$2"
+  shift 2
+  if "$@" 2>&1; then
+    log "$desc"
+  else
+    record_error "Failed: $desc" "$hint"
+  fi
+}
+
+# Check if a binary is on PATH
+has_cmd() { command -v "$1" &>/dev/null; }
+
+# Check if an apt package is installed
+pkg_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
+# Write a file only if content has changed (idempotent file writes)
+# Usage: safe_write "description" "/path/to/file" <<'EOF' ... EOF
+safe_write() {
+  local desc="$1"
+  local dest="$2"
+  local content
+  content=$(cat)
+
+  if [[ -f "$dest" ]]; then
+    local existing
+    existing=$(cat "$dest")
+    if [[ "$existing" == "$content" ]]; then
+      skipped "Config: $desc (unchanged)"
+      SKIPPED+=("Config: $desc")
+      return 0
+    fi
+    # Back up existing config before overwriting
+    cp "$dest" "${dest}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  fi
+
+  mkdir -p "$(dirname "$dest")"
+  echo "$content" > "$dest" && log "Config written: $desc" || \
+    record_error "Failed to write config: $dest" "Check permissions on $(dirname "$dest")"
+}
+
+# Append to a file only if the line isn't already there (idempotent append)
+safe_append() {
+  local desc="$1"
+  local file="$2"
+  local content="$3"
+
+  if grep -qF "$content" "$file" 2>/dev/null; then
+    skipped "Already present in $file: $desc"
+    return 0
+  fi
+  echo "$content" >> "$file" && log "Appended to $file: $desc" || \
+    record_error "Failed to append to $file: $desc"
+}
+
+# =============================================================================
+#  PREFLIGHT CHECKS
+# =============================================================================
+section "Preflight Checks"
+
+# Root check
+if [[ "$EUID" -ne 0 ]]; then
+  echo -e "${RED}This script must be run as root.${NC}"
+  echo "Please run: sudo bash zorin18-gaming-setup.sh"
+  exit 1
 fi
 
-# Store the actual user (not root) for user-level operations
-ACTUAL_USER="${SUDO_USER:-$USER}"
-ACTUAL_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
+# Identify the real user (not root)
+SUDO_USER_NAME="${SUDO_USER:-}"
+if [[ -z "$SUDO_USER_NAME" ]] || [[ "$SUDO_USER_NAME" == "root" ]]; then
+  # Try to find the first non-root user with a home directory
+  SUDO_USER_NAME=$(getent passwd | awk -F: '$3>=1000 && $7!~/nologin|false/ {print $1; exit}')
+fi
+if [[ -z "$SUDO_USER_NAME" ]]; then
+  SUDO_USER_NAME="root"
+  record_warning "Could not determine non-root user -- some user configs will target /root"
+fi
+USER_HOME="/home/$SUDO_USER_NAME"
+[[ "$SUDO_USER_NAME" == "root" ]] && USER_HOME="/root"
+log "Target user: $SUDO_USER_NAME (home: $USER_HOME)"
 
-# --- Welcome ------------------------------------------------------------------
-clear
-echo -e "${BOLD}${CYAN}"
-echo "  ╔═══════════════════════════════════════════════════════╗"
-echo "  ║       Zorin OS Gaming + Audio Production Setup        ║"
-echo "  ║                                                       ║"
-echo "  ║  Steam • Heroic • Focusrite • Peripherals • PipeWire  ║"
-echo "  ╚═══════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-echo -e "Running as: ${BOLD}$ACTUAL_USER${NC}"
-echo -e "Date: $(date)"
+# OS check
+if [[ -f /etc/os-release ]]; then
+  . /etc/os-release
+  OS_NAME="${NAME:-Unknown}"
+  OS_VERSION="${VERSION_ID:-Unknown}"
+  info "OS: $OS_NAME $OS_VERSION"
+  if ! echo "$OS_NAME $OS_VERSION" | grep -qiE "Zorin|Ubuntu"; then
+    record_warning "This script targets Zorin OS 18 / Ubuntu 24.04. Detected: $OS_NAME $OS_VERSION. Proceeding anyway."
+  fi
+else
+  record_warning "Cannot determine OS -- /etc/os-release not found"
+fi
+
+# Internet connectivity check
+info "Checking internet connectivity..."
+if curl -s --max-time 10 https://archive.ubuntu.com > /dev/null 2>&1; then
+  log "Internet connectivity: OK"
+else
+  record_warning "No internet connectivity detected. Installations requiring downloads may fail."
+fi
+
+# Disk space check (require at least 10GB free on /)
+FREE_GB=$(df -BG / | awk 'NR==2 {gsub("G",""); print $4}')
+info "Free disk space: ${FREE_GB}GB"
+if [[ "$FREE_GB" -lt 10 ]]; then
+  record_warning "Less than 10GB free on /. Some installations may fail. Recommended: 20GB+"
+fi
+
+# Log file
+LOGFILE="/var/log/zorin-gaming-media-setup.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+log "Logging to: $LOGFILE"
+
+# =============================================================================
+#  STEP 1 -- HARDWARE DETECTION
+# =============================================================================
+section "Hardware Detection"
+
+# ── CPU ───────────────────────────────────────────────────────────────────────
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "Unknown")
+CPU_VENDOR=$(grep -m1 'vendor_id' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "Unknown")
+CPU_CORES=$(nproc 2>/dev/null || echo "?")
+info "CPU: $CPU_MODEL ($CPU_CORES threads)"
+
+CPU_TYPE="generic"
+if echo "$CPU_VENDOR" | grep -qi "AuthenticAMD"; then
+  CPU_TYPE="amd"; log "CPU vendor: AMD"
+elif echo "$CPU_VENDOR" | grep -qi "GenuineIntel"; then
+  CPU_TYPE="intel"; log "CPU vendor: Intel"
+else
+  record_warning "Unknown CPU vendor ($CPU_VENDOR) -- using generic settings"
+fi
+
+RYZEN_GEN="zen_generic"
+if [[ "$CPU_TYPE" == "amd" ]]; then
+  if   echo "$CPU_MODEL" | grep -qiE "9[0-9]{3}0[A-Z]*$|9[0-9]{3}0X"; then RYZEN_GEN="zen5"
+  elif echo "$CPU_MODEL" | grep -qiE "7[0-9]{3}X3D|9[0-9]{3}X3D";      then RYZEN_GEN="zen4_x3d"
+  elif echo "$CPU_MODEL" | grep -qiE "7[0-9]{3}X|9[0-9]{3}X";           then RYZEN_GEN="zen4"
+  elif echo "$CPU_MODEL" | grep -qiE "5[0-9]{3}X3D";                     then RYZEN_GEN="zen3_x3d"
+  elif echo "$CPU_MODEL" | grep -qiE "5[0-9]{3}";                        then RYZEN_GEN="zen3"
+  fi
+  info "Ryzen generation: $RYZEN_GEN"
+fi
+
+# ── GPU ───────────────────────────────────────────────────────────────────────
+GPU_INFO=$(lspci 2>/dev/null | grep -iE "VGA|3D|Display" || true)
+[[ -z "$GPU_INFO" ]] && record_warning "No GPU detected via lspci -- GPU driver install will be skipped"
+info "GPU(s): ${GPU_INFO:-none detected}"
+
+GPU_TYPE="generic"
+NVIDIA_CARD=""; NVIDIA_GEN=""; NVIDIA_DRIVER=""
+HW_ACCEL_NVENC=false; HW_ACCEL_VAAPI=false; HW_ACCEL_QSV=false
+
+if echo "$GPU_INFO" | grep -qi "NVIDIA"; then
+  GPU_TYPE="nvidia"
+  NVIDIA_CARD=$(echo "$GPU_INFO" | grep -i "NVIDIA" | sed 's/.*\[//;s/\]//' | head -1)
+  log "NVIDIA GPU: $NVIDIA_CARD"
+
+  if   echo "$NVIDIA_CARD" | grep -qiE "RTX 50|50[0-9]{2}"; then
+    NVIDIA_GEN="50series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 40|40[0-9]{2}"; then
+    NVIDIA_GEN="40series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 30|30[0-9]{2}"; then
+    NVIDIA_GEN="30series";       NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "RTX 20|20[0-9]{2}|GTX 16"; then
+    NVIDIA_GEN="turing";         NVIDIA_DRIVER="nvidia-driver-550"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 10|10[0-9]{2}"; then
+    NVIDIA_GEN="pascal";         NVIDIA_DRIVER="nvidia-driver-470"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 9[0-9]{2}|GTX 7[0-9]{2}|GTX 6[0-9]{2}"; then
+    NVIDIA_GEN="maxwell_kepler"; NVIDIA_DRIVER="nvidia-driver-390"; HW_ACCEL_NVENC=true
+  elif echo "$NVIDIA_CARD" | grep -qiE "GTX 58[0-9]|GTX 59[0-9]|GTX 4[0-9]{2}|GTX 5[0-7][0-9]"; then
+    NVIDIA_GEN="fermi";          NVIDIA_DRIVER="nvidia-driver-340"; HW_ACCEL_NVENC=false
+    record_warning "Fermi GPU (GTX 5xx/4xx): nvidia-340 is EOL and may not be in Ubuntu 24.04 repos"
+  else
+    NVIDIA_GEN="unknown";        NVIDIA_DRIVER="nvidia-driver-570"; HW_ACCEL_NVENC=true
+    record_warning "Unknown NVIDIA GPU model -- defaulting to driver 570"
+  fi
+  info "NVIDIA: gen=$NVIDIA_GEN | driver=$NVIDIA_DRIVER | NVENC=$HW_ACCEL_NVENC"
+
+elif echo "$GPU_INFO" | grep -qi "AMD\|ATI\|Radeon"; then
+  GPU_TYPE="amd"
+  HW_ACCEL_VAAPI=true
+  log "AMD GPU detected (VAAPI: supported)"
+
+elif echo "$GPU_INFO" | grep -qi "Intel"; then
+  GPU_TYPE="intel"
+  HW_ACCEL_VAAPI=true; HW_ACCEL_QSV=true
+  log "Intel iGPU detected (VAAPI + QuickSync: supported)"
+fi
+
+# ── Motherboard ───────────────────────────────────────────────────────────────
+MB_MANUFACTURER=$(cat /sys/class/dmi/id/board_vendor  2>/dev/null || echo "Unknown")
+MB_MODEL=$(cat        /sys/class/dmi/id/board_name    2>/dev/null || echo "Unknown")
+MB_VERSION=$(cat      /sys/class/dmi/id/board_version 2>/dev/null || echo "Unknown")
+info "Motherboard: $MB_MANUFACTURER $MB_MODEL ($MB_VERSION)"
+
+MB_TYPE="generic"
+if   echo "$MB_MANUFACTURER" | grep -qi "MSI\|Micro-Star"; then MB_TYPE="msi";     log "MSI motherboard confirmed"
+elif echo "$MB_MANUFACTURER" | grep -qi "ASUS\|ASUSTeK";   then MB_TYPE="asus";    log "ASUS motherboard detected"
+elif echo "$MB_MANUFACTURER" | grep -qi "Gigabyte";         then MB_TYPE="gigabyte";log "Gigabyte motherboard detected"
+elif echo "$MB_MANUFACTURER" | grep -qi "ASRock";           then MB_TYPE="asrock";  log "ASRock motherboard detected"
+fi
+
+# ── RAM ───────────────────────────────────────────────────────────────────────
+RAM_GB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
+[[ "$RAM_GB" -lt 16 ]] && record_warning "Only ${RAM_GB}GB RAM detected -- 16GB+ recommended for video production"
+info "RAM: ${RAM_GB}GB"
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+DISK_TYPE="hdd"
+for dev in /sys/block/nvme* /sys/block/sd*; do
+  [[ -f "$dev/queue/rotational" ]] && [[ "$(cat "$dev/queue/rotational" 2>/dev/null)" == "0" ]] && {
+    DISK_TYPE="ssd_or_nvme"; break
+  }
+done
+info "Primary storage: $DISK_TYPE"
+
+# ── Focusrite Scarlett USB Detection ──────────────────────────────────────────
+SCARLETT_DETECTED=false
+SCARLETT_GEN="3rd"
+SCARLETT_MODEL="Scarlett 3rd Gen (assumed from build spec)"
+
+if has_cmd lsusb; then
+  USB_DEVICES=$(lsusb 2>/dev/null || true)
+  if echo "$USB_DEVICES" | grep -q "1235:"; then
+    FOCUSRITE_LINE=$(echo "$USB_DEVICES" | grep "1235:" | head -1)
+    PRODUCT_ID=$(echo "$FOCUSRITE_LINE" | grep -oP '1235:\K[0-9a-fA-F]+' || echo "")
+    SCARLETT_DETECTED=true
+
+    case "${PRODUCT_ID,,}" in
+      8210) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett 2i2 3rd Gen" ;;
+      8211) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett Solo 3rd Gen" ;;
+      8212) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett 4i4 3rd Gen" ;;
+      8213) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett 8i6 3rd Gen" ;;
+      8214) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett 18i8 3rd Gen" ;;
+      8215) SCARLETT_GEN="3rd";     SCARLETT_MODEL="Scarlett 18i20 3rd Gen" ;;
+      8202) SCARLETT_GEN="2nd";     SCARLETT_MODEL="Scarlett 6i6 2nd Gen" ;;
+      8204) SCARLETT_GEN="2nd";     SCARLETT_MODEL="Scarlett 18i8 2nd Gen" ;;
+      8206) SCARLETT_GEN="2nd";     SCARLETT_MODEL="Scarlett 18i20 2nd Gen" ;;
+      8220) SCARLETT_GEN="4th";     SCARLETT_MODEL="Scarlett Solo 4th Gen" ;;
+      8221) SCARLETT_GEN="4th";     SCARLETT_MODEL="Scarlett 2i2 4th Gen" ;;
+      8222) SCARLETT_GEN="4th";     SCARLETT_MODEL="Scarlett 4i4 4th Gen" ;;
+      8223) SCARLETT_GEN="4th_fcp"; SCARLETT_MODEL="Scarlett 16i16 4th Gen (FCP)" ;;
+      8224) SCARLETT_GEN="4th_fcp"; SCARLETT_MODEL="Scarlett 18i16 4th Gen (FCP)" ;;
+      8225) SCARLETT_GEN="4th_fcp"; SCARLETT_MODEL="Scarlett 18i20 4th Gen (FCP)" ;;
+      820c) SCARLETT_GEN="clarett"; SCARLETT_MODEL="Clarett+ 8Pre" ;;
+      820d) SCARLETT_GEN="clarett"; SCARLETT_MODEL="Clarett USB 8Pre" ;;
+      "")   SCARLETT_GEN="3rd";     SCARLETT_MODEL="Focusrite device (ID parse failed -- assuming 3rd Gen)" ;;
+      *)    SCARLETT_GEN="3rd";     SCARLETT_MODEL="Focusrite device (ID: $PRODUCT_ID -- assuming 3rd Gen)" ;;
+    esac
+    log "Focusrite detected: $SCARLETT_MODEL (gen: $SCARLETT_GEN)"
+  else
+    info "Scarlett not detected via USB -- alsa-scarlett-gui will still be installed"
+    info "Plug in your Scarlett before running if you want precise model detection"
+  fi
+else
+  record_warning "lsusb not available -- Focusrite USB detection skipped. Will install for assumed 3rd Gen."
+fi
+
+# ── Detection Summary ─────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}--- Detection Summary -----------------------------------------${NC}"
+echo -e "  CPU     : $CPU_MODEL ($CPU_TYPE, $CPU_CORES threads)"
+echo -e "  GPU     : ${GPU_INFO:-(none)} ($GPU_TYPE)"
+echo -e "  MOBO    : $MB_MANUFACTURER $MB_MODEL ($MB_TYPE)"
+echo -e "  RAM     : ${RAM_GB}GB"
+echo -e "  DISK    : $DISK_TYPE"
+echo -e "  NVENC   : $HW_ACCEL_NVENC  | VAAPI: $HW_ACCEL_VAAPI  | QSV: $HW_ACCEL_QSV"
+echo -e "  SCARLETT: $SCARLETT_MODEL (gen: $SCARLETT_GEN)"
+echo -e "${BOLD}--------------------------------------------------------------${NC}"
 echo ""
 
+if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+  echo -e "${YELLOW}Pre-flight warnings:${NC}"
+  for w in "${WARNINGS[@]}"; do echo -e "  ${YELLOW}!!${NC} $w"; done
+  echo ""
+fi
+
+read -rp "Proceed with installation? [Y/n]: " CONFIRM
+CONFIRM="${CONFIRM:-Y}"
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+  echo "Aborted by user."; exit 0
+fi
+
 # =============================================================================
-# SECTION 1: System Update
+#  STEP 2 -- SYSTEM PREP
 # =============================================================================
-section "System Update & Upgrade"
+section "System Update & Prerequisites"
 
 info "Updating package lists..."
-apt-get update -qq
-log "Package lists updated"
-
-info "Upgrading all installed packages — this may take a few minutes..."
-apt-get upgrade -y
-log "System packages upgraded"
-
-info "Applying full distribution upgrade (safe)..."
-apt-get dist-upgrade -y
-log "Distribution upgrade complete"
-
-info "Installing prerequisites..."
-apt-get install -y -qq \
-    curl \
-    wget \
-    git \
-    make \
-    gcc \
-    build-essential \
-    software-properties-common \
-    apt-transport-https \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    flatpak \
-    gnome-software-plugin-flatpak 2>/dev/null || true
-
-log "Prerequisites installed"
-
-# Add Flathub if not already added
-if ! flatpak remotes | grep -q flathub; then
-    info "Adding Flathub repository..."
-    flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-    log "Flathub added"
-else
-    log "Flathub already configured"
+if ! apt-get update -y 2>&1; then
+  record_error "apt update failed" "Check internet connection and /etc/apt/sources.list"
 fi
 
-# =============================================================================
-# SECTION 1b: Timeshift — System Snapshot (safety net before we change anything)
-# =============================================================================
-section "Timeshift — System Snapshot"
-
-if ! command -v timeshift &>/dev/null; then
-    info "Installing Timeshift..."
-    apt-get install -y -qq timeshift
-    log "Timeshift installed"
-else
-    log "Timeshift already installed"
+info "Upgrading existing packages..."
+if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 2>&1; then
+  record_warning "apt upgrade had issues -- continuing with remaining steps"
 fi
 
-# Create an initial snapshot so user can roll back if anything goes wrong
-info "Creating system snapshot before setup begins..."
-timeshift --create --comments "Before gaming/audio setup script" --tags D 2>/dev/null && \
-    log "System snapshot created — you can restore this from Timeshift if needed" || \
-    warn "Snapshot failed — Timeshift may need a supported filesystem (ext4/btrfs). Continuing anyway."
+safe_apt "Core build tools & utilities" \
+  curl wget git software-properties-common \
+  build-essential dkms \
+  pciutils dmidecode lshw usbutils \
+  cpufrequtils htop nvtop \
+  flatpak alsa-utils
+
+# Flathub remote -- idempotent, --if-not-exists handles reruns
+safe_run "Flathub remote" "Run: flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo" \
+  flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
 # =============================================================================
-# SECTION 2: Gaming — Steam
+#  STEP 3 -- GPU DRIVERS
 # =============================================================================
-section "Steam Installation"
+section "GPU Drivers"
 
-if dpkg -l | grep -q "^ii  steam"; then
-    log "Steam already installed — skipping"
-else
-    info "Enabling 32-bit architecture for Steam..."
-    dpkg --add-architecture i386
-    apt-get update -qq
+if [[ "$GPU_TYPE" == "nvidia" ]]; then
 
-    info "Installing Steam..."
-    apt-get install -y -qq steam
-    log "Steam installed"
-fi
+  # Blacklist Nouveau -- only write if not already blacklisted
+  if ! grep -q "blacklist nouveau" /etc/modprobe.d/blacklist-nouveau.conf 2>/dev/null; then
+    safe_write "Nouveau blacklist" /etc/modprobe.d/blacklist-nouveau.conf <<'MODEOF'
+blacklist nouveau
+options nouveau modeset=0
+MODEOF
+    safe_run "initramfs update (Nouveau blacklist)" \
+      "Run manually: sudo update-initramfs -u" \
+      update-initramfs -u
+  else
+    skipped "Nouveau already blacklisted"
+    SKIPPED+=("Nouveau blacklist")
+  fi
 
-# =============================================================================
-# SECTION 3: Gaming — GameMode (CPU optimisation)
-# =============================================================================
-section "GameMode — CPU Optimisation"
-
-if dpkg -l | grep -q "^ii  gamemode"; then
-    log "GameMode already installed — skipping"
-else
-    info "Installing GameMode..."
-    apt-get install -y -qq gamemode libgamemode0 libgamemodeauto0
-    log "GameMode installed"
-fi
-
-# Add user to gamemode group
-if ! groups "$ACTUAL_USER" | grep -q gamemode; then
-    usermod -aG gamemode "$ACTUAL_USER"
-    log "Added $ACTUAL_USER to gamemode group"
-else
-    log "$ACTUAL_USER already in gamemode group"
-fi
-
-# =============================================================================
-# SECTION 4: Gaming — Heroic Games Launcher
-# =============================================================================
-section "Heroic Games Launcher (Epic/GOG)"
-
-HEROIC_INSTALLED=false
-
-# Check if already installed via flatpak
-if flatpak list | grep -q "com.heroicgameslauncher.hgl"; then
-    log "Heroic already installed via Flatpak — skipping"
-    HEROIC_INSTALLED=true
-fi
-
-# Check if installed via deb
-if dpkg -l | grep -q "^ii  heroic"; then
-    log "Heroic already installed via deb — skipping"
-    HEROIC_INSTALLED=true
-fi
-
-if [ "$HEROIC_INSTALLED" = false ]; then
-    info "Installing Heroic via Flatpak..."
-    sudo -u "$ACTUAL_USER" flatpak install -y flathub com.heroicgameslauncher.hgl || {
-        warn "Flatpak install failed, trying deb package..."
-        HEROIC_DEB_URL=$(curl -s https://api.github.com/repos/Heroic-Games-Launcher/HeroicGamesLauncher/releases/latest \
-            | grep "browser_download_url.*amd64.deb" \
-            | cut -d '"' -f 4 | head -1)
-        if [ -n "$HEROIC_DEB_URL" ]; then
-            wget -q -O /tmp/heroic.deb "$HEROIC_DEB_URL"
-            apt-get install -y /tmp/heroic.deb
-            rm -f /tmp/heroic.deb
-            log "Heroic installed via deb"
+  if [[ "$NVIDIA_GEN" == "fermi" ]]; then
+    if pkg_installed "nvidia-driver-340"; then
+      skipped "NVIDIA driver (340 -- Fermi)"
+      SKIPPED+=("NVIDIA driver 340")
+    elif apt-cache show nvidia-driver-340 &>/dev/null; then
+      safe_apt_full "NVIDIA driver 340 (Fermi legacy)" nvidia-driver-340
+    else
+      record_error "nvidia-driver-340 not in repos (Fermi/GTX 580/590 is EOL on Ubuntu 24.04)" \
+        "Download manually from: https://www.nvidia.com/en-us/drivers/ or consider ubuntu-drivers autoinstall"
+      info "Attempting ubuntu-drivers autoinstall as fallback..."
+      ubuntu-drivers autoinstall 2>&1 || record_error "ubuntu-drivers autoinstall also failed" \
+        "Manual driver install required for your GPU"
+    fi
+  else
+    # Check if ANY nvidia driver is already installed
+    if dpkg-query -l 'nvidia-driver-*' 2>/dev/null | grep -q "^ii"; then
+      INSTALLED_DRV=$(dpkg-query -l 'nvidia-driver-*' 2>/dev/null | grep "^ii" | awk '{print $2}' | head -1)
+      if pkg_installed "$NVIDIA_DRIVER"; then
+        skipped "NVIDIA driver ($NVIDIA_DRIVER) already installed"
+        SKIPPED+=("NVIDIA driver $NVIDIA_DRIVER")
+      else
+        record_warning "Different NVIDIA driver installed ($INSTALLED_DRV). Target is $NVIDIA_DRIVER."
+        read -rp "Replace $INSTALLED_DRV with $NVIDIA_DRIVER? [y/N]: " REPLACE_DRV
+        REPLACE_DRV="${REPLACE_DRV:-N}"
+        if [[ "$REPLACE_DRV" =~ ^[Yy]$ ]]; then
+          safe_apt_full "NVIDIA driver $NVIDIA_DRIVER" "$NVIDIA_DRIVER" nvidia-settings nvidia-prime
         else
-            warn "Could not fetch Heroic deb URL — please install manually from heroicgameslauncher.com"
+          info "Keeping existing driver $INSTALLED_DRV"
+          SKIPPED+=("NVIDIA driver (kept existing $INSTALLED_DRV)")
         fi
-    }
-    log "Heroic Games Launcher installed"
+      fi
+    else
+      safe_apt_full "NVIDIA driver $NVIDIA_DRIVER" "$NVIDIA_DRIVER" nvidia-settings nvidia-prime
+    fi
+  fi
+
+  # NVIDIA Xorg config -- only write if not present
+  if [[ ! -f /etc/X11/xorg.conf.d/20-nvidia-gaming.conf ]]; then
+    mkdir -p /etc/X11/xorg.conf.d
+    safe_write "NVIDIA Xorg gaming config" /etc/X11/xorg.conf.d/20-nvidia-gaming.conf <<'XORGEOF'
+Section "Device"
+    Identifier     "NVIDIA GPU"
+    Driver         "nvidia"
+    Option         "TripleBuffer"                 "true"
+    Option         "ForceCompositionPipeline"     "true"
+    Option         "ForceFullCompositionPipeline" "true"
+    Option         "AllowIndirectGLXProtocol"     "off"
+EndSection
+XORGEOF
+  else
+    skipped "NVIDIA Xorg config (already present)"
+    SKIPPED+=("NVIDIA Xorg config")
+  fi
+
+  safe_run "NVIDIA persistence mode enable" \
+    "Run: sudo systemctl enable nvidia-persistenced" \
+    systemctl enable nvidia-persistenced
+
+  # NVENC libs
+  if [[ "$HW_ACCEL_NVENC" == "true" ]]; then
+    safe_apt "NVIDIA CUDA toolkit (NVENC)" nvidia-cuda-toolkit
+  fi
+
+  # ReBAR check
+  if lspci -v 2>/dev/null | grep -qi "Resizable BAR"; then
+    log "Resizable BAR (ReBAR) is active"
+  else
+    record_warning "ReBAR not active. Enable in MSI BIOS: Above 4G Decoding + Resizable BAR for up to 15% FPS gain"
+  fi
+
+elif [[ "$GPU_TYPE" == "amd" ]]; then
+
+  safe_ppa "ppa:kisak/kisak-mesa"
+  safe_apt_full "AMD Mesa + AMDVLK + VAAPI" \
+    mesa-vulkan-drivers mesa-vdpau-drivers \
+    libvulkan1 vulkan-tools amdvlk \
+    libva-drm2 libva-x11-2 vainfo mesa-va-drivers
+
+  safe_write "AMD GPU performance udev rule" /etc/udev/rules.d/30-amdgpu-pm.rules <<'UDEVEOF'
+KERNEL=="card0", SUBSYSTEM=="drm", DRIVERS=="amdgpu", ATTR{device/power_dma_latency}="0"
+UDEVEOF
+
+elif [[ "$GPU_TYPE" == "intel" ]]; then
+
+  safe_apt "Intel VAAPI + QuickSync" \
+    intel-media-va-driver i965-va-driver \
+    vainfo libva-drm2 libva-x11-2
+
+fi
+
+# Vulkan support for all GPU types
+safe_apt "Vulkan tools" vulkan-tools libvulkan1
+
+# =============================================================================
+#  STEP 4 -- CPU OPTIMISATIONS
+# =============================================================================
+section "CPU Optimisations"
+
+if [[ "$CPU_TYPE" == "amd" ]]; then
+
+  safe_apt "AMD microcode + cpufrequtils" amd64-microcode cpufrequtils
+
+  # AMD P-State -- add to GRUB only if not already present
+  GRUB_FILE="/etc/default/grub"
+  if grep -q "amd_pstate" "$GRUB_FILE" 2>/dev/null; then
+    skipped "AMD P-State GRUB entry (already configured)"
+    SKIPPED+=("AMD P-State GRUB")
+  else
+    cp "$GRUB_FILE" "${GRUB_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 amd_pstate=active"/' "$GRUB_FILE" && \
+      log "AMD P-State added to GRUB" || \
+      record_error "Failed to update GRUB for AMD P-State" "Manually add amd_pstate=active to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub"
+  fi
+
+  # CPU governor
+  if [[ -f /etc/default/cpufrequtils ]]; then
+    if grep -q 'GOVERNOR="performance"' /etc/default/cpufrequtils; then
+      skipped "CPU governor (already set to performance)"
+      SKIPPED+=("CPU governor")
+    else
+      echo 'GOVERNOR="performance"' > /etc/default/cpufrequtils && \
+        log "CPU governor set to performance" || \
+        record_error "Failed to set CPU governor" "Manually edit /etc/default/cpufrequtils"
+    fi
+  else
+    echo 'GOVERNOR="performance"' > /etc/default/cpufrequtils && \
+      log "CPU governor set to performance" || \
+      record_error "Failed to create /etc/default/cpufrequtils"
+  fi
+  cpufreq-set -g performance 2>/dev/null || true  # Best-effort live apply
+
+  # Ryzen X3D optimisations
+  if echo "$RYZEN_GEN" | grep -q "x3d"; then
+    if [[ -f /etc/systemd/system/ryzen-x3d-opt.service ]]; then
+      skipped "Ryzen X3D systemd service"
+      SKIPPED+=("Ryzen X3D service")
+    else
+      cat > /etc/systemd/system/ryzen-x3d-opt.service <<'SVCEOF'
+[Unit]
+Description=Ryzen X3D 3D V-Cache Optimisations
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo 0 > /proc/sys/kernel/numa_balancing'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+      safe_run "Ryzen X3D service enable" \
+        "Run: sudo systemctl enable ryzen-x3d-opt" \
+        systemctl enable ryzen-x3d-opt
+    fi
+  fi
+
+elif [[ "$CPU_TYPE" == "intel" ]]; then
+
+  safe_apt "Intel microcode + cpufrequtils" intel-microcode cpufrequtils
+
+  if ! grep -q 'GOVERNOR="performance"' /etc/default/cpufrequtils 2>/dev/null; then
+    echo 'GOVERNOR="performance"' > /etc/default/cpufrequtils && \
+      log "CPU governor set to performance" || \
+      record_error "Failed to set CPU governor"
+  else
+    skipped "CPU governor (already set to performance)"
+    SKIPPED+=("CPU governor")
+  fi
+
 fi
 
 # =============================================================================
-# SECTION 4b: Gaming — ProtonPlus (Proton-GE / Wine-GE manager)
+#  STEP 5 -- MOTHERBOARD TWEAKS
 # =============================================================================
-section "ProtonPlus — Custom Proton Version Manager"
+section "Motherboard Configuration"
 
-if flatpak list | grep -q "com.vysp3r.ProtonPlus"; then
-    log "ProtonPlus already installed — skipping"
+if [[ "$MB_TYPE" == "msi" ]]; then
+
+  safe_write "MSI USB polling udev rule" /etc/udev/rules.d/60-usb-polling.rules <<'UDEVEOF'
+# Disable USB autosuspend for gaming/audio peripherals on MSI boards
+SUBSYSTEM=="usb", ATTR{power/autosuspend}="-1"
+UDEVEOF
+
+  # Scheduler tweaks -- append only if not already present
+  safe_append "MSI scheduler tweaks" /etc/sysctl.conf \
+    "kernel.sched_min_granularity_ns = 100000"
+  safe_append "MSI sched wakeup" /etc/sysctl.conf \
+    "kernel.sched_wakeup_granularity_ns = 150000"
+  safe_append "MSI sched migration" /etc/sysctl.conf \
+    "kernel.sched_migration_cost_ns = 250000"
+
+elif [[ "$MB_TYPE" == "asus" ]]; then
+  info "ASUS board: manual BIOS tuning recommended (AI Suite not available on Linux)"
+fi
+
+# =============================================================================
+#  STEP 6 -- CODECS & MEDIA LIBRARIES
+# =============================================================================
+section "Codecs & Media Libraries"
+
+media "Installing FFmpeg and codec libraries..."
+
+# Ubuntu restricted extras (MP3, H.264, AAC etc.)
+if ! pkg_installed ubuntu-restricted-extras && ! pkg_installed ubuntu-restricted-addons; then
+  safe_apt_full "Ubuntu restricted extras (codecs)" ubuntu-restricted-extras
 else
-    info "Installing ProtonPlus via Flatpak..."
-    sudo -u "$ACTUAL_USER" flatpak install -y flathub com.vysp3r.ProtonPlus && \
-        log "ProtonPlus installed" || \
-        warn "ProtonPlus install failed — you can install it manually from Flathub"
+  skipped "Ubuntu restricted extras (already installed)"
+  SKIPPED+=("Ubuntu restricted extras")
+fi
+
+safe_apt "FFmpeg full build" ffmpeg libavcodec-extra
+
+safe_apt "FFmpeg development libraries" \
+  libavformat-dev libavutil-dev \
+  libswscale-dev libswresample-dev libavfilter-dev
+
+safe_apt "GStreamer core stack" \
+  gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good \
+  gstreamer1.0-libav \
+  gstreamer1.0-vaapi \
+  gstreamer1.0-pipewire
+
+safe_apt "Image codec libraries" \
+  libheif-dev libraw-dev \
+  libjpeg-dev libpng-dev libtiff-dev libwebp-dev
+
+# GPU-accelerated FFmpeg encoding
+if [[ "$GPU_TYPE" == "nvidia" ]] && [[ "$HW_ACCEL_NVENC" == "true" ]]; then
+  if ffmpeg -encoders 2>/dev/null | grep -q nvenc; then
+    log "FFmpeg NVENC encoder: READY"
+  else
+    warn "FFmpeg NVENC not active yet -- will be available after reboot with driver"
+  fi
+  info "FFmpeg NVENC usage: -c:v h264_nvenc or -c:v hevc_nvenc"
+fi
+
+if [[ "$HW_ACCEL_VAAPI" == "true" ]]; then
+  safe_apt "VAAPI development library" libva-dev
+  if ffmpeg -hwaccels 2>/dev/null | grep -q vaapi; then
+    log "FFmpeg VAAPI acceleration: READY"
+  else
+    warn "FFmpeg VAAPI not active yet -- will be available after reboot"
+  fi
+  info "FFmpeg VAAPI usage: -hwaccel vaapi -c:v h264_vaapi"
 fi
 
 # =============================================================================
-# SECTION 5: Gaming — Proton / Wine dependencies
+#  STEP 7 -- AUDIO STACK (PIPEWIRE + JACK)
 # =============================================================================
-section "Proton & Wine Dependencies"
+section "Audio Stack -- PipeWire & JACK"
 
-info "Installing Wine and Proton dependencies..."
-apt-get install -y -qq \
-    wine \
-    wine32 \
-    wine64 \
-    winetricks \
-    winbind \
-    cabextract \
-    libvulkan1 \
-    libvulkan1:i386 \
-    mesa-vulkan-drivers \
-    mesa-vulkan-drivers:i386 \
-    vulkan-tools \
-    dxvk 2>/dev/null || true
+safe_apt "PipeWire full stack" \
+  pipewire pipewire-audio \
+  pipewire-pulse pipewire-jack \
+  wireplumber pavucontrol qpwgraph
 
-log "Wine/Proton dependencies installed"
+safe_apt "JACK pro audio" jackd2 jack-tools qjackctl a2jmidid
 
-# =============================================================================
-# SECTION 5b: GPU Driver Auto-Detection & Installation
-# =============================================================================
-section "GPU Driver Auto-Detection"
-
-GPU_VENDOR=""
-GPU_INFO=$(lspci 2>/dev/null | grep -iE "VGA|3D|Display" || true)
-info "Detected GPU(s): $GPU_INFO"
-
-if echo "$GPU_INFO" | grep -qi nvidia; then
-    GPU_VENDOR="nvidia"
-    log "Nvidia GPU detected"
-elif echo "$GPU_INFO" | grep -qi "amd\|radeon\|advanced micro"; then
-    GPU_VENDOR="amd"
-    log "AMD GPU detected"
-elif echo "$GPU_INFO" | grep -qi intel; then
-    GPU_VENDOR="intel"
-    log "Intel GPU detected"
+# Add user to audio group (idempotent -- groups -G handles existing membership)
+if id "$SUDO_USER_NAME" 2>/dev/null | grep -q "audio"; then
+  skipped "User $SUDO_USER_NAME already in audio group"
+  SKIPPED+=("Audio group membership")
 else
-    warn "Could not determine GPU vendor — skipping GPU-specific driver install"
+  usermod -aG audio "$SUDO_USER_NAME" 2>/dev/null && \
+    log "User $SUDO_USER_NAME added to audio group" || \
+    record_error "Failed to add $SUDO_USER_NAME to audio group" \
+      "Run: sudo usermod -aG audio $SUDO_USER_NAME"
 fi
 
-case "$GPU_VENDOR" in
-    nvidia)
-        info "Installing Nvidia drivers and Vulkan support..."
-        apt-get install -y -qq ubuntu-drivers-common 2>/dev/null || true
-        RECOMMENDED=$(ubuntu-drivers devices 2>/dev/null | grep recommended | awk '{print $3}' | head -1 || true)
-
-        if [ -n "$RECOMMENDED" ]; then
-            info "Recommended Nvidia driver: $RECOMMENDED"
-            apt-get install -y -qq "$RECOMMENDED" 2>/dev/null || \
-                apt-get install -y -qq nvidia-driver-535 2>/dev/null || true
-        else
-            warn "Could not auto-detect recommended driver — installing nvidia-driver-535 as fallback"
-            apt-get install -y -qq nvidia-driver-535 2>/dev/null || true
-        fi
-
-        apt-get install -y -qq \
-            libnvidia-gl-535 \
-            libnvidia-gl-535:i386 2>/dev/null || true
-
-        if command -v nvidia-smi &>/dev/null; then
-            nvidia-smi -pm 1 2>/dev/null || true
-            log "Nvidia persistence mode enabled"
-        fi
-        log "Nvidia drivers installed"
-        ;;
-
-    amd)
-        info "Installing AMD Mesa + Vulkan support..."
-        apt-get install -y -qq \
-            mesa-vulkan-drivers \
-            mesa-vulkan-drivers:i386 \
-            libdrm-amdgpu1 \
-            firmware-amd-graphics \
-            radeontop \
-            amdvlk \
-            mesa-opencl-icd 2>/dev/null || true
-        log "AMD drivers and Vulkan support installed"
-        ;;
-
-    intel)
-        info "Installing Intel graphics support..."
-        apt-get install -y -qq \
-            intel-media-va-driver \
-            i965-va-driver \
-            mesa-vulkan-drivers \
-            mesa-vulkan-drivers:i386 2>/dev/null || true
-        log "Intel graphics support installed"
-        ;;
-esac
-
-# =============================================================================
-# SECTION 6: Peripheral Support — Logitech / General Mice (Piper + libratbag)
-# =============================================================================
-section "Mouse Peripheral Support — Piper (Logitech, Razer, SteelSeries)"
-
-if dpkg -l | grep -q "^ii  piper"; then
-    log "Piper already installed — skipping"
+# Realtime audio limits -- only write if not already configured
+if [[ -f /etc/security/limits.d/99-realtime-audio.conf ]]; then
+  skipped "Realtime audio limits (already configured)"
+  SKIPPED+=("Realtime audio limits")
 else
-    info "Installing Piper and libratbag..."
-    apt-get install -y -qq piper libratbag-dev ratbagd 2>/dev/null || {
-        # Fallback to flatpak if apt version unavailable
-        info "Trying Piper via Flatpak..."
-        sudo -u "$ACTUAL_USER" flatpak install -y flathub org.freedesktop.Piper || \
-            warn "Piper install failed — device may still work without GUI configuration"
-    }
-    log "Piper installed"
-fi
-
-# Enable ratbagd service for mouse configuration
-if systemctl list-unit-files | grep -q ratbagd; then
-    systemctl enable --now ratbagd 2>/dev/null || true
-    log "ratbagd service enabled"
-fi
-
-# =============================================================================
-# SECTION 7: Peripheral Support — Razer (OpenRazer)
-# =============================================================================
-section "Razer Device Support — OpenRazer"
-
-if dpkg -l | grep -q "^ii  openrazer-meta"; then
-    log "OpenRazer already installed — skipping"
-else
-    info "Adding OpenRazer PPA..."
-    add-apt-repository -y ppa:openrazer/stable 2>/dev/null || \
-        warn "Could not add OpenRazer PPA — skipping Razer support"
-
-    apt-get update -qq
-
-    info "Installing OpenRazer..."
-    apt-get install -y -qq openrazer-meta 2>/dev/null || \
-        warn "OpenRazer install failed — skipping"
-
-    # Install Polychromatic GUI for Razer RGB
-    apt-get install -y -qq polychromatic 2>/dev/null || \
-        sudo -u "$ACTUAL_USER" flatpak install -y flathub app.polychromatic.Polychromatic 2>/dev/null || \
-        warn "Polychromatic GUI not available — OpenRazer still functional via CLI"
-
-    log "OpenRazer installed"
-fi
-
-# Add user to plugdev group for Razer device access
-if ! groups "$ACTUAL_USER" | grep -q plugdev; then
-    usermod -aG plugdev "$ACTUAL_USER"
-    log "Added $ACTUAL_USER to plugdev group"
-fi
-
-# =============================================================================
-# SECTION 8: Controller Support
-# =============================================================================
-section "Controller Support (Xbox / PlayStation / Generic)"
-
-info "Installing controller support packages..."
-apt-get install -y -qq \
-    joystick \
-    jstest-gtk \
-    evtest \
-    xboxdrv \
-    steam-devices 2>/dev/null || true
-
-# Xbox controller (xpad is built into kernel but xpadneo gives better support)
-if ! dkms status | grep -q xpadneo 2>/dev/null; then
-    info "Installing xpadneo for enhanced Xbox controller support..."
-    apt-get install -y -qq dkms linux-headers-$(uname -r) 2>/dev/null || true
-    
-    if [ -d /tmp/xpadneo ]; then rm -rf /tmp/xpadneo; fi
-    git clone --depth=1 https://github.com/atar-axis/xpadneo.git /tmp/xpadneo 2>/dev/null && \
-        bash /tmp/xpadneo/install.sh 2>/dev/null && \
-        log "xpadneo installed for Xbox controllers" || \
-        warn "xpadneo install failed — standard Xbox support still available via xpad kernel module"
-else
-    log "xpadneo already installed"
-fi
-
-# PS4/PS5 controller support via SDL2 and udev rules
-info "Installing PlayStation controller support..."
-apt-get install -y -qq \
-    libsdl2-dev \
-    libsdl2-2.0-0 2>/dev/null || true
-
-# Add udev rules for PS4/PS5 if not present
-UDEV_RULES_FILE="/etc/udev/rules.d/70-sony-controllers.rules"
-if [ ! -f "$UDEV_RULES_FILE" ]; then
-    info "Adding Sony controller udev rules..."
-    cat > "$UDEV_RULES_FILE" << 'EOF'
-# PS4 DualShock 4
-KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="05c4", MODE="0666"
-KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="09cc", MODE="0666"
-# PS5 DualSense
-KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", MODE="0666"
-# PS3 DualShock 3
-KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0268", MODE="0666"
-EOF
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger 2>/dev/null || true
-    log "Sony controller udev rules added"
-else
-    log "Sony controller udev rules already present"
-fi
-
-log "Controller support configured"
-
-# =============================================================================
-# SECTION 9: Audio — PipeWire Optimisation
-# =============================================================================
-section "PipeWire Audio Optimisation"
-
-info "Ensuring PipeWire stack is fully installed..."
-apt-get install -y -qq \
-    pipewire \
-    pipewire-pulse \
-    pipewire-jack \
-    pipewire-audio \
-    wireplumber \
-    libspa-0.2-jack \
-    libspa-0.2-bluetooth 2>/dev/null || true
-
-# Create low latency PipeWire config for the actual user
-PIPEWIRE_CONF_DIR="$ACTUAL_HOME/.config/pipewire"
-PIPEWIRE_CONF_FILE="$PIPEWIRE_CONF_DIR/pipewire.conf.d/10-lowlatency.conf"
-
-if [ ! -f "$PIPEWIRE_CONF_FILE" ]; then
-    info "Configuring PipeWire for low latency..."
-    mkdir -p "$PIPEWIRE_CONF_DIR/pipewire.conf.d"
-    cat > "$PIPEWIRE_CONF_FILE" << 'EOF'
-# Low latency PipeWire configuration
-context.properties = {
-    default.clock.rate          = 48000
-    default.clock.quantum       = 64
-    default.clock.min-quantum   = 32
-    default.clock.max-quantum   = 8192
-}
-EOF
-    chown -R "$ACTUAL_USER:$ACTUAL_USER" "$PIPEWIRE_CONF_DIR"
-    log "PipeWire low latency config written"
-else
-    log "PipeWire low latency config already exists — skipping"
-fi
-
-# Restart PipeWire as the actual user
-sudo -u "$ACTUAL_USER" systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || \
-    warn "Could not restart PipeWire — please log out and back in"
-
-log "PipeWire configured"
-
-# =============================================================================
-# SECTION 9b: Audio — Real-Time Privileges (limits.conf) & Cadence
-# =============================================================================
-section "Audio Real-Time Privileges & Cadence"
-
-# --- limits.conf — give user real-time scheduling without root ----------------
-LIMITS_CONF="/etc/security/limits.d/99-realtime-audio.conf"
-
-if [ -f "$LIMITS_CONF" ]; then
-    log "Real-time audio limits already configured — skipping"
-else
-    info "Setting real-time scheduling privileges for audio..."
-    cat > "$LIMITS_CONF" << EOF
-# Real-time audio privileges for $ACTUAL_USER
-# Allows low-latency audio without running as root
-@audio   -  rtprio     95
+  safe_write "Realtime audio limits" /etc/security/limits.d/99-realtime-audio.conf <<'EOF'
+# Realtime audio priority for pro audio production
+@audio   -  rtprio     99
 @audio   -  memlock    unlimited
 @audio   -  nice      -19
-$ACTUAL_USER - rtprio  95
-$ACTUAL_USER - memlock unlimited
-$ACTUAL_USER - nice    -19
 EOF
-    log "Real-time audio limits written to $LIMITS_CONF"
 fi
 
-# Add user to audio group if not already
-if ! groups "$ACTUAL_USER" | grep -q "\baudio\b"; then
-    usermod -aG audio "$ACTUAL_USER"
-    log "Added $ACTUAL_USER to audio group"
+# PipeWire low-latency config -- only write if not already configured
+if [[ -f /etc/pipewire/pipewire.conf.d/99-gaming-media.conf ]]; then
+  skipped "PipeWire low-latency config (already configured)"
+  SKIPPED+=("PipeWire config")
 else
-    log "$ACTUAL_USER already in audio group"
-fi
-
-# --- PAM limits — ensure limits.conf is actually loaded ----------------------
-# SAFE: We use a drop-in file in /etc/pam.d/ rather than editing common-session
-# directly. This means Zorin OS updates to common-session will never conflict.
-PAM_DROPIN="/etc/pam.d/99-realtime-audio-limits"
-if [ -f "$PAM_DROPIN" ]; then
-    log "PAM drop-in limits file already exists — skipping"
-else
-    info "Creating PAM drop-in for real-time limits..."
-    cat > "$PAM_DROPIN" << 'EOF'
-# Drop-in PAM config to load limits.conf for real-time audio
-# This file is managed by the gaming/audio setup script
-# Safe to remove if real-time audio privileges are no longer needed
-session required pam_limits.so
+  mkdir -p /etc/pipewire/pipewire.conf.d
+  safe_write "PipeWire low-latency config" \
+    /etc/pipewire/pipewire.conf.d/99-gaming-media.conf <<'EOF'
+context.properties = {
+  default.clock.rate          = 48000
+  default.clock.quantum       = 512
+  default.clock.min-quantum   = 32
+  default.clock.max-quantum   = 2048
+}
 EOF
-    log "PAM drop-in written to $PAM_DROPIN — core system files untouched"
-fi
-
-# --- Cadence (KXStudio audio toolbox) ----------------------------------------
-if command -v cadence &>/dev/null; then
-    log "Cadence already installed — skipping"
-else
-    info "Adding KXStudio repository for Cadence..."
-    # Download and install KXStudio repo
-    wget -q -O /tmp/kxstudio-repos.deb \
-        https://launchpad.net/~kxstudio-debian/+archive/kxstudio/+files/kxstudio-repos_11.1.0_all.deb 2>/dev/null || true
-
-    if [ -f /tmp/kxstudio-repos.deb ]; then
-        apt-get install -y -qq /tmp/kxstudio-repos.deb 2>/dev/null || true
-        rm -f /tmp/kxstudio-repos.deb
-        apt-get update -qq
-
-        info "Installing Cadence..."
-        apt-get install -y -qq cadence 2>/dev/null && \
-            log "Cadence installed" || \
-            warn "Cadence not available from KXStudio — trying direct apt..."
-    fi
-
-    # Fallback — try apt directly (may be in Ubuntu repos)
-    if ! command -v cadence &>/dev/null; then
-        apt-get install -y -qq cadence 2>/dev/null && \
-            log "Cadence installed via apt" || \
-            warn "Cadence unavailable — you can install it manually from kx.studio"
-    fi
 fi
 
 # =============================================================================
-# SECTION 10: Focusrite Auto-Detection + alsa-scarlett-gui
+#  STEP 7.5 -- FOCUSRITE SCARLETT (alsa-scarlett-gui)
+#  Follows: https://github.com/geoffreybennett/alsa-scarlett-gui/blob/master/docs/INSTALL.md
 # =============================================================================
-section "Focusrite Scarlett Auto-Detection"
+section "Focusrite Scarlett -- alsa-scarlett-gui"
 
-# Detect any connected Focusrite device via lsusb
-FOCUSRITE_DETECTED=false
-FOCUSRITE_MODEL=""
+media "Detected: $SCARLETT_MODEL (Gen: $SCARLETT_GEN)"
 
-if command -v lsusb &>/dev/null; then
-    # Focusrite vendor ID is 1235
-    LSUSB_OUTPUT=$(lsusb 2>/dev/null | grep -i "1235:" || true)
-    
-    if [ -n "$LSUSB_OUTPUT" ]; then
-        FOCUSRITE_DETECTED=true
-        FOCUSRITE_MODEL=$(echo "$LSUSB_OUTPUT" | head -1)
-        log "Focusrite device detected: $FOCUSRITE_MODEL"
+# Kernel version check (Scarlett2 driver needs 6.7+; Zorin OS 18 ships 6.14)
+KERNEL_VER=$(uname -r)
+KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
+KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2 | cut -d- -f1)
+info "Running kernel: $KERNEL_VER"
+
+KERNEL_OK=true
+if [[ "$KERNEL_MAJOR" -lt 6 ]] || { [[ "$KERNEL_MAJOR" -eq 6 ]] && [[ "$KERNEL_MINOR" -lt 7 ]]; }; then
+  KERNEL_OK=false
+  record_error "Kernel $KERNEL_VER is older than 6.7 -- Scarlett2 driver requires 6.7+" \
+    "See: https://github.com/geoffreybennett/alsa-scarlett-gui/blob/master/docs/OLDKERNEL.md"
+else
+  log "Kernel $KERNEL_VER: Scarlett2 driver supported"
+fi
+
+if [[ "$SCARLETT_DETECTED" == "true" ]]; then
+  if dmesg 2>/dev/null | grep -qi "Focusrite Scarlett.*Mixer Driver enabled"; then
+    log "Scarlett2 kernel driver: ACTIVE"
+  else
+    record_warning "Scarlett Mixer Driver not seen in dmesg yet -- verify after reboot with: dmesg | grep -i focusrite"
+  fi
+fi
+
+# Install build dependencies (exact Ubuntu deps per INSTALL.md)
+safe_apt "alsa-scarlett-gui build dependencies" \
+  git make gcc libgtk-4-dev libasound2-dev libssl-dev
+
+# Clone / update alsa-scarlett-gui
+BUILD_DIR="/opt/alsa-scarlett-gui"
+safe_clone "alsa-scarlett-gui" \
+  "https://github.com/geoffreybennett/alsa-scarlett-gui.git" \
+  "$BUILD_DIR"
+
+# Build -- only rebuild if binary is missing or source is newer
+BINARY="/usr/local/bin/alsa-scarlett-gui"
+if [[ -x "$BINARY" ]] && [[ -d "$BUILD_DIR/src" ]]; then
+  SOURCE_MOD=$(find "$BUILD_DIR/src" -name "*.c" -newer "$BINARY" 2>/dev/null | wc -l)
+  if [[ "$SOURCE_MOD" -eq 0 ]]; then
+    skipped "alsa-scarlett-gui binary (already built and up to date)"
+    SKIPPED+=("alsa-scarlett-gui build")
+  else
+    info "Source files newer than binary -- rebuilding..."
+    SOURCE_MOD=999  # Force rebuild path below
+  fi
+else
+  SOURCE_MOD=999  # Force build
+fi
+
+if [[ "$SOURCE_MOD" -gt 0 ]]; then
+  if [[ -d "$BUILD_DIR/src" ]]; then
+    info "Building alsa-scarlett-gui..."
+    if make -C "$BUILD_DIR/src" 2>&1; then
+      log "alsa-scarlett-gui built successfully"
+      if make -C "$BUILD_DIR/src" install 2>&1; then
+        log "alsa-scarlett-gui installed to /usr/local/bin/"
+        INSTALLED+=("alsa-scarlett-gui")
+      else
+        record_error "alsa-scarlett-gui make install failed" \
+          "Run manually: cd $BUILD_DIR/src && sudo make install"
+      fi
     else
-        warn "No Focusrite device currently connected via USB"
-        info "alsa-scarlett-gui will still be installed for when you connect your interface"
+      record_error "alsa-scarlett-gui build (make) failed" \
+        "Check build deps: git make gcc libgtk-4-dev libasound2-dev libssl-dev"
     fi
-else
-    apt-get install -y -qq usbutils -qq
-    warn "lsusb was not available — installed now. Re-run script after connecting your Focusrite"
+  else
+    record_error "alsa-scarlett-gui source directory not found ($BUILD_DIR/src)" \
+      "Clone manually: git clone https://github.com/geoffreybennett/alsa-scarlett-gui.git $BUILD_DIR"
+  fi
 fi
 
-# Install alsa-scarlett-gui dependencies and build regardless
-info "Installing alsa-scarlett-gui build dependencies..."
-apt-get install -y -qq \
-    libgtk-4-dev \
-    libasound2-dev \
-    libssl-dev \
-    alsa-utils 2>/dev/null || true
+# Firmware setup
+mkdir -p /usr/lib/firmware/scarlett2 /usr/lib/firmware/scarlett4
 
-# Build alsa-scarlett-gui if not already built
-SCARLETT_GUI_BIN="/usr/local/bin/alsa-scarlett-gui"
-SCARLETT_GUI_DESKTOP="/usr/share/applications/alsa-scarlett-gui.desktop"
-
-if [ -f "$SCARLETT_GUI_BIN" ]; then
-    log "alsa-scarlett-gui already installed at $SCARLETT_GUI_BIN — skipping build"
-else
-    info "Cloning and building alsa-scarlett-gui..."
-    
-    BUILD_DIR="/tmp/alsa-scarlett-gui-build"
-    if [ -d "$BUILD_DIR" ]; then rm -rf "$BUILD_DIR"; fi
-    
-    git clone --depth=1 https://github.com/geoffreybennett/alsa-scarlett-gui "$BUILD_DIR"
-    
-    cd "$BUILD_DIR/src"
-    make -j$(nproc)
-    
-    # Install binary system-wide
-    install -m 755 alsa-scarlett-gui "$SCARLETT_GUI_BIN"
-    
-    # Install icon if present
-    if [ -f "$BUILD_DIR/img/alsa-scarlett-gui.png" ]; then
-        install -D -m 644 "$BUILD_DIR/img/alsa-scarlett-gui.png" \
-            /usr/share/icons/hicolor/256x256/apps/alsa-scarlett-gui.png
+# scarlett2-firmware: recommended for Gen 2/3, mandatory for Gen 4
+if [[ "$SCARLETT_GEN" =~ ^(2nd|3rd|clarett|4th)$ ]]; then
+  FIRMWARE_DEST="/usr/lib/firmware/scarlett2"
+  if [[ -n "$(ls -A "$FIRMWARE_DEST" 2>/dev/null)" ]]; then
+    skipped "scarlett2-firmware (already present in $FIRMWARE_DEST)"
+    SKIPPED+=("scarlett2-firmware")
+  else
+    media "Downloading scarlett2-firmware..."
+    FW2_DIR="/tmp/scarlett2-firmware-dl"
+    if safe_clone "scarlett2-firmware" \
+        "https://github.com/geoffreybennett/scarlett2-firmware.git" "$FW2_DIR"; then
+      cp -r "$FW2_DIR"/firmware/* "$FIRMWARE_DEST/" 2>/dev/null && \
+        log "scarlett2-firmware installed to $FIRMWARE_DEST" || \
+        record_error "Failed to copy scarlett2-firmware files" \
+          "Copy manually from $FW2_DIR/firmware/ to $FIRMWARE_DEST/"
     fi
-    
-    # Create desktop entry
-    cat > "$SCARLETT_GUI_DESKTOP" << 'EOF'
-[Desktop Entry]
-Name=Scarlett GUI
-Comment=Focusrite Scarlett mixer control
-Exec=alsa-scarlett-gui
-Icon=alsa-scarlett-gui
-Terminal=false
-Type=Application
-Categories=Audio;Mixer;
-Keywords=focusrite;scarlett;audio;interface;
-EOF
-    
-    # Update icon cache
-    update-icon-caches /usr/share/icons/hicolor 2>/dev/null || true
-    
-    cd /
-    rm -rf "$BUILD_DIR"
-    
-    log "alsa-scarlett-gui built and installed to $SCARLETT_GUI_BIN"
+  fi
 fi
 
-# Check for MSD mode issue and warn user
-if [ "$FOCUSRITE_DETECTED" = true ]; then
-    echo ""
-    warn "IMPORTANT — Focusrite MSD Mode:"
-    echo -e "  If your Scarlett shows as a USB storage device rather than audio,"
-    echo -e "  hold the ${BOLD}48V button${NC} while powering on to disable MSD mode."
-    echo ""
+# scarlett4-firmware: mandatory for 4th Gen
+if [[ "$SCARLETT_GEN" =~ ^(4th|4th_fcp)$ ]]; then
+  FIRMWARE4_DEST="/usr/lib/firmware/scarlett4"
+  if [[ -n "$(ls -A "$FIRMWARE4_DEST" 2>/dev/null)" ]]; then
+    skipped "scarlett4-firmware (already present in $FIRMWARE4_DEST)"
+    SKIPPED+=("scarlett4-firmware")
+  else
+    media "Downloading scarlett4-firmware (mandatory for 4th Gen)..."
+    FW4_DIR="/tmp/scarlett4-firmware-dl"
+    if safe_clone "scarlett4-firmware" \
+        "https://github.com/geoffreybennett/scarlett4-firmware.git" "$FW4_DIR"; then
+      cp -r "$FW4_DIR"/firmware/* "$FIRMWARE4_DEST/" 2>/dev/null && \
+        log "scarlett4-firmware installed to $FIRMWARE4_DEST" || \
+        record_error "Failed to copy scarlett4-firmware files (mandatory for 4th Gen!)" \
+          "Copy manually from $FW4_DIR/firmware/ to $FIRMWARE4_DEST/"
+    fi
+  fi
 fi
 
-# =============================================================================
-# SECTION 10b: System Tuning — Swappiness & CPU Governor
-# =============================================================================
-section "System Tuning — Swappiness & CPU Governor"
-
-# --- Swappiness ---------------------------------------------------------------
-SYSCTL_CONF="/etc/sysctl.d/99-gaming-audio.conf"
-
-if grep -q "vm.swappiness" "$SYSCTL_CONF" 2>/dev/null; then
-    log "Swappiness already configured — skipping"
-else
-    info "Setting swappiness to 10 (default is 60)..."
-    cat >> "$SYSCTL_CONF" << 'EOF'
-
-# Prefer RAM over swap — better for gaming and audio
-vm.swappiness=10
-
-# Reduce dirty page writeback lag — helps with audio dropouts
-vm.dirty_ratio=6
-vm.dirty_background_ratio=3
-
-# Increase max file watchers — helps Steam and some games
-fs.inotify.max_user_watches=524288
-EOF
-    sysctl -p "$SYSCTL_CONF" 2>/dev/null || true
-    log "Swappiness set to 10, dirty ratios tuned, inotify watches increased"
+# fcp-server daemon -- required for Scarlett 4th Gen big interfaces
+if [[ "$SCARLETT_GEN" == "4th_fcp" ]]; then
+  if has_cmd fcp-server; then
+    skipped "fcp-server (already installed)"
+    SKIPPED+=("fcp-server")
+  else
+    media "Building fcp-server (required for 4th Gen 16i16/18i16/18i20)..."
+    FCP_DIR="/opt/fcp-support"
+    if safe_clone "fcp-support" \
+        "https://github.com/geoffreybennett/fcp-support.git" "$FCP_DIR"; then
+      if make -C "$FCP_DIR" 2>&1 && make -C "$FCP_DIR" install 2>&1; then
+        safe_run "fcp-server service enable" \
+          "Run: sudo systemctl enable fcp-server" \
+          systemctl enable fcp-server
+        log "fcp-server installed and enabled"
+        INSTALLED+=("fcp-server")
+      else
+        record_error "fcp-server build failed (required for 4th Gen big interfaces)" \
+          "Build manually from: $FCP_DIR"
+      fi
+    fi
+  fi
 fi
 
-# --- CPU Governor -------------------------------------------------------------
-info "Installing cpufrequtils for CPU governor management..."
-apt-get install -y -qq cpufrequtils 2>/dev/null || true
-
-# Set performance governor persistently
-# SAFE: /etc/default/cpufrequtils is a cpufrequtils-owned config file.
-# We only write it if it doesn't already exist or has no GOVERNOR set.
-CPU_CONF="/etc/default/cpufrequtils"
-if grep -q "^GOVERNOR=" "$CPU_CONF" 2>/dev/null; then
-    log "CPU governor already configured in $CPU_CONF — skipping"
-else
-    info "Setting CPU governor to performance mode..."
-    # Append rather than overwrite in case file exists with other settings
-    echo 'GOVERNOR="performance"' >> "$CPU_CONF"
-    systemctl restart cpufrequtils 2>/dev/null || true
-    log "CPU governor set to performance"
+# MSD mode notice
+if [[ "$SCARLETT_GEN" =~ ^(3rd|4th|4th_fcp)$ ]]; then
+  echo ""
+  warn "ACTION REQUIRED -- MSD (Mass Storage Device) Mode:"
+  info "  Scarlett 3rd/4th Gen ships in MSD mode which blocks full driver access."
+  info "  To disable:"
+  info "    Option 1 (Hardware): Hold the 48V button while powering on the Scarlett"
+  info "    Option 2 (Software): Run alsa-scarlett-gui -> Startup window -> Disable MSD Mode -> reboot interface"
+  echo ""
 fi
 
-# Also apply immediately to all cores right now
-for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo performance > "$cpu" 2>/dev/null || true
+# Disable alsa-state / alsa-restore -- they overwrite Scarlett's stored settings on reconnect
+for svc in alsa-state alsa-restore; do
+  if systemctl is-enabled "$svc" &>/dev/null; then
+    systemctl disable "$svc" 2>/dev/null && \
+      log "$svc disabled (prevents Scarlett settings overwrite)" || \
+      record_error "Failed to disable $svc" "Run: sudo systemctl disable $svc"
+    systemctl stop "$svc" 2>/dev/null || true
+  else
+    skipped "$svc (already disabled or not present)"
+    SKIPPED+=("$svc disable")
+  fi
 done
-log "Performance governor applied to all CPU cores"
+
+log "Focusrite Scarlett setup complete"
 
 # =============================================================================
-# SECTION 11: Kernel Options
+#  STEP 8 -- MEDIA & VIDEO PRODUCTION SOFTWARE
 # =============================================================================
-section "Kernel Configuration"
+section "Media & Video Production Software"
 
-CURRENT_KERNEL=$(uname -r)
-info "Current kernel: $CURRENT_KERNEL"
+# Video players
+safe_apt "VLC + MPV" vlc mpv
 
-# Install lowlatency kernel if not present
-if dpkg -l | grep -q "^ii  linux-lowlatency"; then
-    log "Low latency kernel already installed"
+# MPV hardware-accelerated config -- write once, don't overwrite user changes
+MPV_CONF="$USER_HOME/.config/mpv/mpv.conf"
+if [[ -f "$MPV_CONF" ]]; then
+  skipped "MPV config (already exists -- not overwriting user config)"
+  SKIPPED+=("MPV config")
 else
-    info "Installing low latency kernel..."
-    apt-get install -y -qq linux-lowlatency
-    log "Low latency kernel installed"
+  mkdir -p "$USER_HOME/.config/mpv"
+  {
+    cat <<'MPVEOF'
+# MPV -- hardware accelerated, high quality
+profile=gpu-hq
+scale=lanczos
+cscale=spline36
+dscale=mitchell
+video-sync=display-resample
+interpolation=yes
+tscale=oversample
+MPVEOF
+    if   [[ "$GPU_TYPE" == "nvidia" ]]; then printf "hwdec=nvdec\ngpu-api=vulkan\n"
+    elif [[ "$GPU_TYPE" =~ ^(amd|intel)$ ]]; then printf "hwdec=vaapi\ngpu-api=vulkan\n"
+    fi
+  } > "$MPV_CONF"
+  chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$USER_HOME/.config/mpv" 2>/dev/null || true
+  log "MPV config written (hwdec: $([ "$GPU_TYPE" == "nvidia" ] && echo nvdec || echo vaapi))"
+  INSTALLED+=("MPV config")
 fi
 
-# Offer realtime kernel info
-if dpkg -l | grep -q "^ii  linux-realtime"; then
-    log "Real-time kernel already installed"
-else
-    info "Real-time kernel available but not auto-installed."
-    echo -e "  To install: ${BOLD}sudo apt install linux-realtime${NC}"
-    echo -e "  Recommended for dedicated audio production sessions."
-    echo -e "  Both kernels can coexist — select at boot via GRUB."
+# Video editing
+safe_flatpak "Kdenlive NLE"  "org.kde.kdenlive"
+safe_flatpak "HandBrake"     "fr.handbrake.ghb"
+
+echo ""
+media "DaVinci Resolve: manual install required"
+info "  -> https://www.blackmagicdesign.com/products/davinciresolve"
+info "  -> Zorin OS 18 + NVIDIA: fully supported (Resolve 19+)"
+info "  -> AMD: free version supported (ROCM support varies by card)"
+echo ""
+
+# Streaming
+safe_ppa "ppa:obsproject/obs-studio"
+safe_apt_full "OBS Studio" obs-studio
+if [[ "$HW_ACCEL_NVENC" == "true" ]]; then
+  info "OBS: Settings -> Output -> Encoder -> NVENC H.264 or NVENC HEVC"
+elif [[ "$HW_ACCEL_VAAPI" == "true" ]]; then
+  info "OBS: Settings -> Output -> Encoder -> VA-API H.264"
 fi
 
-# =============================================================================
-# SECTION 12: Additional Gaming Optimisations
-# =============================================================================
-section "Additional Gaming Optimisations"
+# Photo editing
+safe_apt "GIMP + plugins" gimp gimp-plugin-registry gimp-gmic
+safe_apt "Photo management" rawtherapee darktable
 
-# MangoHud — performance overlay
-if ! command -v mangohud &>/dev/null; then
-    info "Installing MangoHud (performance overlay)..."
-    apt-get install -y -qq mangohud 2>/dev/null || \
-        sudo -u "$ACTUAL_USER" flatpak install -y flathub org.freedesktop.Platform.VulkanLayer.MangoHud 2>/dev/null || \
-        warn "MangoHud not available in repos — skip"
-    log "MangoHud installed"
-else
-    log "MangoHud already installed"
-fi
+# Audio production
+safe_apt "Hydrogen drum machine" hydrogen
 
-# vkBasalt — post processing
-if ! dpkg -l | grep -q "^ii  vkbasalt"; then
-    info "Installing vkBasalt (Vulkan post-processing layer)..."
-    apt-get install -y -qq vkbasalt 2>/dev/null || true
-fi
+# Media inspection
+safe_apt "Media management tools" \
+  mediainfo mediainfo-gui \
+  mkvtoolnix mkvtoolnix-gui \
+  ffmpegthumbnailer exiftool
 
-# --- Vesktop (better Discord client for Linux) --------------------------------
-if flatpak list | grep -q "dev.vencord.Vesktop"; then
-    log "Vesktop already installed — skipping"
-else
-    info "Installing Vesktop (optimised Discord client)..."
-    sudo -u "$ACTUAL_USER" flatpak install -y flathub dev.vencord.Vesktop && \
-        log "Vesktop installed" || \
-        warn "Vesktop install failed — install manually from flathub"
-fi
-
-# --- Flatseal (Flatpak permission manager) ------------------------------------
-if flatpak list | grep -q "com.github.tchx84.Flatseal"; then
-    log "Flatseal already installed — skipping"
-else
-    info "Installing Flatseal (Flatpak permission manager)..."
-    sudo -u "$ACTUAL_USER" flatpak install -y flathub com.github.tchx84.Flatseal && \
-        log "Flatseal installed" || \
-        warn "Flatseal install failed — install manually from flathub"
-fi
-
-# Feral GameMode config for Steam
-GAMEMODE_CONF="$ACTUAL_HOME/.config/gamemode.ini"
-if [ ! -f "$GAMEMODE_CONF" ]; then
-    info "Writing GameMode config..."
-    mkdir -p "$ACTUAL_HOME/.config"
-    cat > "$GAMEMODE_CONF" << 'EOF'
-[general]
-renice=10
-softrealtime=auto
-inhibit_screensaver=1
-
-[gpu]
-apply_gpu_optimisations=accept-responsibility
-gpu_device=0
-amd_performance_level=high
-
-[custom]
-start=notify-send "GameMode" "Gaming optimisations active"
-end=notify-send "GameMode" "Gaming optimisations disabled"
-EOF
-    chown "$ACTUAL_USER:$ACTUAL_USER" "$GAMEMODE_CONF"
-    log "GameMode config written"
-else
-    log "GameMode config already exists — skipping"
-fi
-
-log "Gaming optimisations complete"
+# GameMode + MangoHud
+safe_apt "GameMode + MangoHud" gamemode mangohud
 
 # =============================================================================
-# SECTION 13: Final apt cleanup
+#  STEP 9 -- SYSTEM-WIDE PERFORMANCE TWEAKS
 # =============================================================================
-section "Cleanup"
+section "System Performance Tweaks"
 
-apt-get autoremove -y -qq
-apt-get autoclean -y -qq
+# vm.max_map_count
+safe_append "vm.max_map_count (Proton/Wine games)" /etc/sysctl.conf \
+  "vm.max_map_count=2147483642"
+
+# inotify watches
+safe_append "inotify watches (video project files)" /etc/sysctl.conf \
+  "fs.inotify.max_user_watches=524288"
+
+# Network gaming optimisations -- append individually for idempotency
+safe_append "net rmem_max" /etc/sysctl.conf "net.core.rmem_max=134217728"
+safe_append "net wmem_max" /etc/sysctl.conf "net.core.wmem_max=134217728"
+safe_append "net tcp_fastopen" /etc/sysctl.conf "net.ipv4.tcp_fastopen=3"
+safe_append "net netdev_max_backlog" /etc/sysctl.conf "net.core.netdev_max_backlog=5000"
+
+# NMI watchdog off
+safe_append "NMI watchdog off" /etc/sysctl.conf "kernel.nmi_watchdog=0"
+
+# Apply sysctl now (best-effort -- some keys may not exist on all kernels)
+sysctl -p 2>/dev/null || record_warning "Some sysctl settings could not be applied live -- will apply on reboot"
+log "sysctl settings applied"
+
+# I/O scheduler
+if [[ ! -f /etc/udev/rules.d/60-ioscheduler.rules ]]; then
+  safe_write "I/O scheduler udev rules" /etc/udev/rules.d/60-ioscheduler.rules <<'UDEVEOF'
+# NVMe/SSD: no scheduler (max throughput for video files)
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="none"
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
+# HDD: mq-deadline (sequential video reads)
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
+UDEVEOF
+else
+  skipped "I/O scheduler udev rules (already configured)"
+  SKIPPED+=("I/O scheduler rules")
+fi
+
+# THP -- madvise is the right balance: gaming anti-stutter + video editor compat
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+echo madvise > /sys/kernel/mm/transparent_hugepage/defrag  2>/dev/null || true
+
+if [[ ! -f /etc/systemd/system/thp-madvise.service ]]; then
+  safe_write "THP madvise systemd service" /etc/systemd/system/thp-madvise.service <<'SVCEOF'
+[Unit]
+Description=Set THP to madvise (gaming anti-stutter + video editor compat)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled && echo madvise > /sys/kernel/mm/transparent_hugepage/defrag'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  safe_run "THP madvise service enable" \
+    "Run: sudo systemctl enable thp-madvise" \
+    systemctl enable thp-madvise
+else
+  skipped "THP madvise service (already configured)"
+  SKIPPED+=("THP madvise service")
+fi
+
+# =============================================================================
+#  STEP 10 -- GAMING SOFTWARE STACK
+# =============================================================================
+section "Gaming Software Stack"
+
+# 32-bit architecture (idempotent)
+if ! dpkg --print-foreign-architectures 2>/dev/null | grep -q i386; then
+  safe_run "Enable 32-bit architecture" \
+    "Run: sudo dpkg --add-architecture i386 && sudo apt update" \
+    dpkg --add-architecture i386
+  apt-get update -y 2>&1 || record_warning "apt update after enabling i386 had warnings"
+else
+  skipped "32-bit (i386) architecture (already enabled)"
+  SKIPPED+=("i386 architecture")
+fi
+
+safe_apt "Wine 64+32-bit + Winetricks" \
+  wine wine32 wine64 winetricks \
+  cabextract unzip p7zip-full
+
+# Steam
+if has_cmd steam || pkg_installed steam-installer; then
+  skipped "Steam (already installed)"
+  SKIPPED+=("Steam")
+else
+  safe_apt_full "Steam" steam-installer
+fi
+
+# Lutris
+if has_cmd lutris; then
+  skipped "Lutris (already installed)"
+  SKIPPED+=("Lutris")
+else
+  safe_ppa "ppa:lutris-team/lutris"
+  safe_apt_full "Lutris" lutris
+fi
+
+safe_flatpak "ProtonUp-Qt"    "net.davidotek.pupgui2"
+safe_flatpak "Heroic Launcher" "com.heroicgameslauncher.hgl"
+safe_flatpak "Bottles"         "com.usebottles.bottles"
+
+# =============================================================================
+#  STEP 11 -- GAMEMODE & MANGOHUD CONFIG
+# =============================================================================
+section "GameMode & MangoHud"
+
+# Enable GameMode daemon globally (idempotent)
+systemctl --global enable gamemoded 2>/dev/null || \
+  record_warning "Could not enable gamemoded globally -- may need to enable per-user"
+
+# GameMode group
+if getent group gamemode &>/dev/null; then
+  if id "$SUDO_USER_NAME" 2>/dev/null | grep -q "gamemode"; then
+    skipped "$SUDO_USER_NAME already in gamemode group"
+    SKIPPED+=("gamemode group membership")
+  else
+    usermod -aG gamemode "$SUDO_USER_NAME" 2>/dev/null && \
+      log "$SUDO_USER_NAME added to gamemode group" || \
+      record_error "Failed to add $SUDO_USER_NAME to gamemode group" \
+        "Run: sudo usermod -aG gamemode $SUDO_USER_NAME"
+  fi
+fi
+
+# MangoHud config -- only write if not already present
+MANGOHUD_CONF="$USER_HOME/.config/MangoHud/MangoHud.conf"
+if [[ -f "$MANGOHUD_CONF" ]]; then
+  skipped "MangoHud config (already exists -- not overwriting)"
+  SKIPPED+=("MangoHud config")
+else
+  mkdir -p "$USER_HOME/.config/MangoHud"
+  cat > "$MANGOHUD_CONF" <<MHEOF
+# MangoHud -- Zorin OS 18 Gaming & Media Beast
+gpu_stats
+gpu_temp
+gpu_load_change
+gpu_name
+cpu_stats
+cpu_temp
+cpu_mhz
+fps
+fps_limit=0
+frame_timing
+vram
+ram
+io_stats
+network
+show_fps_limit
+toggle_hud=Shift_R+F12
+toggle_logging=Shift_L+F2
+output_folder=$USER_HOME/.local/share/MangoHud/
+MHEOF
+  chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$USER_HOME/.config/MangoHud" 2>/dev/null || true
+  log "MangoHud configured (toggle: RShift+F12)"
+  INSTALLED+=("MangoHud config")
+fi
+
+# =============================================================================
+#  STEP 12 -- DISPLAY SERVER CHECK
+# =============================================================================
+section "Display Server"
+
+if [[ "$GPU_TYPE" == "nvidia" ]]; then
+  record_warning "NVIDIA GPU: X11 is more stable than Wayland for gaming, OBS, and DaVinci Resolve. Switch at login (gear icon -> Zorin Desktop on Xorg)."
+fi
+
+# =============================================================================
+#  STEP 13 -- GRUB UPDATE & CLEANUP
+# =============================================================================
+section "GRUB Update & Cleanup"
+
+safe_run "GRUB update" "Run: sudo update-grub" update-grub
+
+apt-get autoremove -y 2>&1 || record_warning "apt autoremove had warnings"
+apt-get autoclean  -y 2>&1 || record_warning "apt autoclean had warnings"
 log "System cleaned up"
 
 # =============================================================================
-# SUMMARY
+#  FINAL REPORT
 # =============================================================================
-echo ""
+section "Setup Complete -- Final Report"
+
 echo -e "${BOLD}${GREEN}"
-echo "  ╔═══════════════════════════════════════════════════════╗"
-echo "  ║                  Setup Complete! ✓                    ║"
-echo "  ╚═══════════════════════════════════════════════════════╝"
+echo "  +======================================================+"
+echo "  |   Zorin OS 18 -- Gaming & Media Beast Setup Done!   |"
+echo "  +======================================================+"
 echo -e "${NC}"
 
-echo -e "${BOLD}What was installed/configured:${NC}"
-echo -e "  ${GREEN}✓${NC} Timeshift system snapshot"
-echo -e "  ${GREEN}✓${NC} Steam + 32-bit libraries"
-echo -e "  ${GREEN}✓${NC} GameMode (CPU optimisation)"
-echo -e "  ${GREEN}✓${NC} Heroic Games Launcher"
-echo -e "  ${GREEN}✓${NC} ProtonPlus (Proton-GE / Wine-GE manager)"
-echo -e "  ${GREEN}✓${NC} GPU drivers auto-detected and installed"
-echo -e "  ${GREEN}✓${NC} Wine + Proton dependencies + DXVK + Vulkan"
-echo -e "  ${GREEN}✓${NC} Piper + libratbag (Logitech/SteelSeries mice)"
-echo -e "  ${GREEN}✓${NC} OpenRazer + Polychromatic (Razer devices)"
-echo -e "  ${GREEN}✓${NC} xpadneo (Xbox controllers)"
-echo -e "  ${GREEN}✓${NC} PS4/PS5 DualShock/DualSense udev rules"
-echo -e "  ${GREEN}✓${NC} PipeWire low latency config (48kHz / 64 quantum)"
-echo -e "  ${GREEN}✓${NC} Real-time audio privileges (limits.conf + PAM)"
-echo -e "  ${GREEN}✓${NC} Cadence (KXStudio audio toolbox)"
-echo -e "  ${GREEN}✓${NC} alsa-scarlett-gui (Focusrite Scarlett control)"
-echo -e "  ${GREEN}✓${NC} Swappiness tuned (10) + dirty ratios optimised"
-echo -e "  ${GREEN}✓${NC} CPU governor set to performance"
-echo -e "  ${GREEN}✓${NC} Low latency kernel"
-echo -e "  ${GREEN}✓${NC} Vesktop (optimised Discord client)"
-echo -e "  ${GREEN}✓${NC} Flatseal (Flatpak permission manager)"
-echo -e "  ${GREEN}✓${NC} MangoHud performance overlay"
+echo -e "${BOLD}Detected Hardware:${NC}"
+echo "  CPU     : $CPU_MODEL ($CPU_TYPE, $CPU_CORES threads)"
+echo "  GPU     : $GPU_TYPE $([ "$GPU_TYPE" == "nvidia" ] && echo "-> $NVIDIA_DRIVER" || echo "")"
+echo "  MOBO    : $MB_MANUFACTURER $MB_MODEL ($MB_TYPE)"
+echo "  RAM     : ${RAM_GB}GB | DISK: $DISK_TYPE"
+echo "  Scarlett: $SCARLETT_MODEL (gen: $SCARLETT_GEN)"
 echo ""
 
-echo -e "${BOLD}${YELLOW}Action required — please reboot:${NC}"
-echo -e "  A reboot is needed to:"
-echo -e "  • Load the low latency kernel"
-echo -e "  • Apply group membership changes (gamemode, plugdev, audio)"
-echo -e "  • Activate xpadneo kernel module"
-echo -e "  • Apply real-time audio privilege limits"
-echo -e "  • Apply CPU governor changes"
+# Installed this run
+if [[ ${#INSTALLED[@]} -gt 0 ]]; then
+  echo -e "${BOLD}${GREEN}Installed this run (${#INSTALLED[@]} items):${NC}"
+  for item in "${INSTALLED[@]}"; do echo "  [OK] $item"; done
+  echo ""
+fi
+
+# Skipped (already present)
+if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+  echo -e "${BOLD}${BLUE}Already installed / skipped (${#SKIPPED[@]} items):${NC}"
+  for item in "${SKIPPED[@]}"; do echo "  [--] $item"; done
+  echo ""
+fi
+
+# Post-reboot steps
+echo -e "${BOLD}Post-Reboot Steps:${NC}"
+echo "  1. Steam -> Settings -> Compatibility"
+echo "     -> Enable Steam Play for all titles"
+echo "     -> Install Proton-GE via ProtonUp-Qt"
+echo ""
+echo "  2. Per-game Steam launch options:"
+echo "     DXVK_ASYNC=1 gamemoderun mangohud %command%"
+echo ""
+echo "  3. OBS Studio -> Settings -> Output -> Encoder:"
+if [[ "$HW_ACCEL_NVENC" == "true" ]];   then echo "     -> Select 'NVENC H.264' or 'NVENC HEVC'"
+elif [[ "$HW_ACCEL_VAAPI" == "true" ]]; then echo "     -> Select 'VA-API H.264'"; fi
+echo ""
+echo "  4. MSI BIOS (if not done):"
+echo "     -> Enable A-XMP/EXPO (RAM rated speed)"
+echo "     -> Enable Resizable BAR + Above 4G Decoding"
+echo "     -> Set PCIe to Gen 4/5"
+echo ""
+if [[ "$GPU_TYPE" == "nvidia" ]]; then
+  echo "  5. nvidia-settings after reboot:"
+  echo "     -> PowerMizer -> Prefer Maximum Performance"
+  echo "     -> Enable ForceCompositionPipeline (X11 only)"
+  echo ""
+fi
+echo "  6. DaVinci Resolve: https://www.blackmagicdesign.com/products/davinciresolve"
+echo ""
+echo "  7. Focusrite Scarlett ($SCARLETT_MODEL):"
+if [[ "$SCARLETT_GEN" =~ ^(3rd|4th|4th_fcp)$ ]]; then
+  echo "     -> Disable MSD mode: hold 48V on power-on OR run alsa-scarlett-gui -> Startup -> Disable MSD"
+fi
+echo "     -> Run: alsa-scarlett-gui"
+echo "     -> Verify driver: dmesg | grep -i focusrite"
 echo ""
 
-echo -e "${BOLD}Post-reboot tips:${NC}"
-echo -e "  • In Steam: Enable Steam Play for all titles in Settings → Compatibility"
-echo -e "  • Launch games with: ${BOLD}gamemoderun %command%${NC} in Steam launch options"
-echo -e "  • Focusrite GUI: run ${BOLD}alsa-scarlett-gui${NC} or find it in your app menu"
-echo -e "  • Switch kernels at boot: hold ${BOLD}Shift${NC} during startup to open GRUB"
-echo -e "  • For RT kernel: ${BOLD}sudo apt install linux-realtime${NC}"
-echo -e "  • Use Flatseal to manage permissions for Heroic, Vesktop, ProtonPlus"
-echo -e "  • Open ProtonPlus and download latest Proton-GE before gaming"
-echo -e "  • Cadence can be used to manage JACK alongside PipeWire"
-echo ""
+# ── ERRORS (most important section -- shown last so it's impossible to miss) ──
+if [[ ${#ERRORS[@]} -gt 0 ]]; then
+  echo ""
+  echo -e "${BOLD}${RED}+----------------------------------------------------+"
+  echo -e "| ERRORS ENCOUNTERED (${#ERRORS[@]}) -- ACTION REQUIRED      |"
+  echo -e "+----------------------------------------------------+${NC}"
+  echo ""
+  for i in "${!ERRORS[@]}"; do
+    NUM=$((i + 1))
+    ENTRY="${ERRORS[$i]}"
+    MSG=$(echo "$ENTRY" | sed 's/ || FIX:.*//')
+    FIX=$(echo "$ENTRY" | grep -oP '(?<=FIX: ).*' || echo "See log: $LOGFILE")
+    echo -e "  ${RED}[$NUM]${NC} ${MSG#ERROR: }"
+    echo -e "       ${YELLOW}Fix: $FIX${NC}"
+    echo ""
+  done
+  echo -e "${YELLOW}Full log available at: $LOGFILE${NC}"
+  echo ""
+  echo -e "${YELLOW}NOTE: The system may still be functional.${NC}"
+  echo -e "${YELLOW}      Review each error above and apply the suggested fix.${NC}"
+  echo ""
+else
+  echo -e "${BOLD}${GREEN}No errors encountered. All steps completed successfully.${NC}"
+  echo ""
+fi
 
-echo -e "  ${CYAN}Enjoy your setup!${NC}"
+echo -e "${BOLD}${RED}A reboot is required for all changes to take effect.${NC}"
 echo ""
+read -rp "Reboot now? [Y/n]: " REBOOT_NOW
+REBOOT_NOW="${REBOOT_NOW:-Y}"
+if [[ "$REBOOT_NOW" =~ ^[Yy]$ ]]; then
+  info "Rebooting in 5 seconds... Log saved to $LOGFILE"
+  sleep 5
+  reboot
+else
+  info "Remember to reboot. Full log: $LOGFILE"
+fi
